@@ -79,11 +79,8 @@ pub struct SubscriptionPayload {
 // Add a new non-pro subscription, or increment the quantity.
 // TODO: take price ID to determine type of subscription? Or have console send
 // type as well?
-// What if the user subscribes to several price_ids for the rds product?
-// What if we want to support different configs for rds, e.g. different instance sizes?
 // If the checkout is completed in the console, why do we need to send the checkout session
-// to the backend?
-// Do we need to send a checkout session from the console?
+// to the backend? Can the console simply send the subscription id and/or type?
 #[instrument(skip(user_manager, account_name), fields(account.name = %account_name))]
 pub(crate) async fn add_subscription(
     _: Admin,
