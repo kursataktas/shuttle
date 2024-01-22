@@ -520,7 +520,11 @@ where
 
         debug!(
             shuttle.container.id = container_id,
-            "Moving project from {previous_state} to {new_state}"
+            shuttle.container.previous_state = previous_state,
+            shuttle.container.state = new_state,
+            // Used in the OTEL container configuration to sample this event
+            shuttle.container.stayed_in_same_state = true,
+            "Moving project state"
         );
 
         new

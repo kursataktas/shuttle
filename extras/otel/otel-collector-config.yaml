@@ -1,7 +1,22 @@
+
+extensions:
+  basicauth/otlp:
+    client_auth:
+      username: 
+      password: 
+
 receivers:
   otlp:
     protocols:
       grpc:
+  # Collect own metrics
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: otel-collector-metrics
+          scrape_interval: 10s
+          static_configs:
+            - targets: ["127.0.0.1:8888"]
   # The hostmetrics receiver is required to get correct infrastructure metrics in Datadog.
   hostmetrics:
     collection_interval: 10s
@@ -23,14 +38,6 @@ receivers:
       memory:
       network:
       processes:
-  # The prometheus receiver scrapes metrics needed for the OpenTelemetry Collector Dashboard.
-  prometheus/otel:
-    config:
-      scrape_configs:
-        - job_name: "otelcol"
-          scrape_interval: 10s
-          static_configs:
-            - targets: ["0.0.0.0:8888"]
   docker_stats:
     endpoint: unix:///var/run/docker.sock
     timeout: 20s
@@ -45,40 +52,175 @@ processors:
     timeout: 10s
   attributes:
     actions:
-      - key: env
-        value: ${env:SHUTTLE_ENV}
-        action: insert
+      # - key: env
+      #   value: ${env:SHUTTLE_ENV}
+      #   action: insert
+      - key: http.status_code
+        action: convert
+        converted_type: int
+      - key: proxy.status_code
+        action: convert
+        converted_type: int
   resource:
     attributes:
+      # See https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/1909
+      # as for why we need that.
       - key: deployment.environment
         action: upsert
         value: ${env:SHUTTLE_ENV}
-  # See https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/1909
-  # as for why we need that.
+  tail_sampling/otlp:
+    decision_wait: 10s
+    policies: [
+        # Rule 1: Sample everything that isn't from the proxy or the span event "Moving project state"
+        {
+          name: always-sample-default,
+          type: and,
+          and:
+            {
+              and_sub_policy:
+                [
+                  {
+                    name: always-sample-condition,
+                    type: ottl_condition,
+                    ottl_condition:
+                      {
+                        error_mode: ignore,
+                        span: ['name != "proxy"'],
+                        spanevent:
+                          [
+                            'not (attributes["shuttle.container.stayed_in_same_state"] == true and name == "Moving project state")',
+                          ],
+                      },
+                  },
+                  { name: sample-everything-policy, type: always_sample },
+                ],
+            },
+        },
+        # Rule 2: Sampling for the moving project spanevent.
+        { name: moving-project-state-sample, type: and, and: { and_sub_policy: [
+                  {
+                    name: moving-project-state-sample-invert,
+                    type: ottl_condition,
+                    ottl_condition:
+                      {
+                        error_mode: ignore,
+                        spanevent:
+                          [
+                            'attributes["shuttle.container.stayed_in_same_state"] == true and name == "Moving project state"',
+                          ],
+                      },
+                  },
+                  {
+                    # apply probabilistic sampling
+                    name: moving-project-state-sample-probabilistic-policy,
+                    type: probabilistic,
+                    probabilistic: { sampling_percentage: 10 },
+                  },
+                ] } },
+        # Rule 3: For the proxy, heavily sample the OPTION call
+        { name: proxy-sample-option, type: and, and: { and_sub_policy: [
+                  {
+                    name: proxy-sample-option-proxy,
+                    type: ottl_condition,
+                    ottl_condition:
+                      { error_mode: ignore, span: ['name == "proxy"'] },
+                  },
+                  {
+                    name: proxy-sample-option-method,
+                    type: string_attribute,
+                    string_attribute: { key: http.method, values: [OPTION] },
+                  },
+                  {
+                    # apply probabilistic sampling
+                    name: proxy-sample-option-policy,
+                    type: probabilistic,
+                    probabilistic: { sampling_percentage: 0.1 },
+                  },
+                ] } },
+        # Rule 4: For the proxy, sample the good status code a bit less
+        { name: proxy-sample-success, type: and, and: { and_sub_policy: [
+                  {
+                    name: proxy-sample-success-proxy,
+                    type: ottl_condition,
+                    ottl_condition:
+                      { error_mode: ignore, span: ['name == "proxy"'] },
+                  },
+                  {
+                    name: proxy-sample-success-status-code-ok,
+                    # type: status_code,
+                    # status_code: { status_codes: [OK] },
+                    type: numeric_attribute,
+                    numeric_attribute:
+                      { key: http.status_code, min_value: 0, max_value: 499 },
+                  },
+                  {
+                    # apply probabilistic sampling
+                    name: proxy-sample-success-probabilistic-policy,
+                    type: probabilistic,
+                    probabilistic: { sampling_percentage: 1 },
+                  },
+                ] } },
+        # Rule 5: For the proxy, always sample the error status code
+        { name: proxy-sample-error, type: and, and: { and_sub_policy: [
+                  {
+                    name: proxy-sample-error-proxy,
+                    type: ottl_condition,
+                    ottl_condition:
+                      { error_mode: ignore, span: ['name == "proxy"'] },
+                  },
+                  {
+                    name: proxy-sample-status-code-error,
+                    # type: status_code,
+                    # status_code: { status_codes: [ERROR] },
+                    type: numeric_attribute,
+                    numeric_attribute:
+                      { key: http.status_code, min_value: 499, max_value: 600 },
+                  },
+                  { name: sample-everything-policy, type: always_sample },
+                ] } },
+      ]
 
 exporters:
-  datadog:
-    api:
-      site: datadoghq.eu
-      key: ${env:DD_API_KEY}
-    traces:
-      span_name_as_resource_name: true
-      # peer_tags_aggregation: true
-  otlp:
-    endpoint: "api.honeycomb.io:443"
-    headers:
-      "x-honeycomb-team": ${env:HONEYCOMB_API_KEY}
+  otlphttp:
+    auth:
+      authenticator: basicauth/otlp
+    endpoint: https://otlp-gateway-prod-eu-west-2.grafana.net/otlp
+  # datadog:
+  #   api:
+  #     site: datadoghq.eu
+  #     key: ${env:DD_API_KEY}
+  #   traces:
+  #     span_name_as_resource_name: true
+  #     # peer_tags_aggregation: true
+  # otlp:
+  #   endpoint: "api.honeycomb.io:443"
+  #   headers:
+  #     "x-honeycomb-team": ${env:HONEYCOMB_API_KEY}
+  debug:
+    # verbosity: detailed
+
 service:
+  extensions: [basicauth/prw, basicauth/otlp]
   pipelines:
-    traces:
+    # traces:
+    #   receivers: [otlp]
+    #   processors: [attributes, batch]
+    #   exporters: [datadog]
+    traces/2:
       receivers: [otlp]
-      processors: [attributes, batch]
-      exporters: [datadog, otlp]
+      # processors: [batch]
+      processors: [attributes, tail_sampling/otlp, batch]
+      exporters: [debug, otlphttp]
+    metrics:
+      receivers: [otlp]
+      processors: []
+      # use configured prometheusremotewrite exporter
+      exporters: [debug, otlphttp]
     logs:
       receivers: [otlp]
-      processors: [attributes, batch]
-      exporters: [datadog, otlp]
+      processors: [batch]
+      exporters: [otlphttp]
+  telemetry:
     metrics:
-      receivers: [hostmetrics, prometheus/otel, otlp]
-      processors: [attributes, batch]
-      exporters: [datadog]
+      address: 127.0.0.1:8888
+      level: detailed
