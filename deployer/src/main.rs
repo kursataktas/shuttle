@@ -2,13 +2,13 @@ use std::process::exit;
 
 use clap::Parser;
 use shuttle_common::{
-    backends::tracing::setup_tracing,
+    backends::trace::setup_tracing,
     claims::{ClaimLayer, InjectPropagationLayer},
     log::{Backend, DeploymentLogLayer},
 };
 use shuttle_deployer::{start, start_proxy, Args, Persistence, RuntimeManager, StateChangeLayer};
 use shuttle_proto::{
-    builder::builder_client::BuilderClient,
+    // builder::builder_client::BuilderClient,
     logger::{logger_client::LoggerClient, Batcher},
 };
 use tokio::select;
@@ -27,7 +27,7 @@ async fn main() {
 
     let (persistence, _) = Persistence::new(
         &args.state,
-        &args.resource_recorder,
+        args.resource_recorder.clone(),
         &args.provisioner_address,
         Ulid::from_string(args.project_id.as_str())
             .expect("to get a valid ULID for project_id arg"),
@@ -46,18 +46,19 @@ async fn main() {
     let logger_client = LoggerClient::new(channel);
     let logger_batcher = Batcher::wrap(logger_client.clone());
 
-    let builder_client = match args.builder_uri.connect().await {
-        Ok(channel) => Some(BuilderClient::new(
-            ServiceBuilder::new()
-                .layer(ClaimLayer)
-                .layer(InjectPropagationLayer)
-                .service(channel),
-        )),
-        Err(err) => {
-            error!("Couldn't connect to the shuttle-builder: {err}");
-            None
-        }
-    };
+    let builder_client = None;
+    // let builder_client = match args.builder_uri.connect().await {
+    //     Ok(channel) => Some(BuilderClient::new(
+    //         ServiceBuilder::new()
+    //             .layer(ClaimLayer)
+    //             .layer(InjectPropagationLayer)
+    //             .service(channel),
+    //     )),
+    //     Err(err) => {
+    //         error!("Couldn't connect to the shuttle-builder: {err}");
+    //         None
+    //     }
+    // };
 
     setup_tracing(
         tracing_subscriber::registry()

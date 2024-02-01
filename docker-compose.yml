@@ -1,11 +1,9 @@
 version: "3.7"
 volumes:
   auth-vol:
-  builder-store-vol:
+  # builder-store-vol:
   gateway-vol:
   postgres-vol:
-  panamax-crates-vol:
-  panamax-io-index-vol:
   resource-recorder-vol:
   mongodb-vol:
 networks:
@@ -64,37 +62,37 @@ services:
       # Using them will result in error because they are not handled gracefully.
       # start_period: 10s
       # start_interval: 2s
-  builder:
-    image: "${CONTAINER_REGISTRY}/builder:${BUILDER_TAG}"
-    depends_on:
-      - auth
-    ports:
-      - 8009:8000
-    deploy:
-      restart_policy:
-        condition: on-failure
-        delay: 5s
-        max_attempts: 3
-      update_config:
-        order: start-first
-        failure_action: rollback
-        delay: 10s
-      rollback_config:
-        parallelism: 0
-        order: stop-first
-      placement:
-        constraints:
-          - node.hostname==builder
-    networks:
-      user-net:
-    volumes:
-      - builder-store-vol:/nix/store
-    environment:
-      - RUST_LOG=${RUST_LOG}
-      - SHUTTLE_ENV=${SHUTTLE_ENV}
-    command:
-      - "--address=0.0.0.0:8000"
-      - "--auth-uri=http://auth:8000"
+  # builder:
+  #   image: "${CONTAINER_REGISTRY}/builder:${BUILDER_TAG}"
+  #   depends_on:
+  #     - auth
+  #   ports:
+  #     - 8009:8000
+  #   deploy:
+  #     restart_policy:
+  #       condition: on-failure
+  #       delay: 5s
+  #       max_attempts: 3
+  #     update_config:
+  #       order: start-first
+  #       failure_action: rollback
+  #       delay: 10s
+  #     rollback_config:
+  #       parallelism: 0
+  #       order: stop-first
+  #     placement:
+  #       constraints:
+  #         - node.hostname==builder
+  #   networks:
+  #     user-net:
+  #   volumes:
+  #     - builder-store-vol:/nix/store
+  #   environment:
+  #     - RUST_LOG=${RUST_LOG}
+  #     - SHUTTLE_ENV=${SHUTTLE_ENV}
+  #   command:
+  #     - "--address=0.0.0.0:8000"
+  #     - "--auth-uri=http://auth:8000"
   gateway:
     image: "${CONTAINER_REGISTRY}/gateway:${GATEWAY_TAG}"
     depends_on:
@@ -221,6 +219,8 @@ services:
       - "--internal-pg-address=postgres"
       - "--fqdn=${DB_FQDN}"
       - "--auth-uri=http://auth:8000"
+      - "--gateway-uri=http://gateway:8001"
+      - "--resource-recorder-uri=http://resource-recorder:8000"
   resource-recorder:
     image: "${CONTAINER_REGISTRY}/resource-recorder:${RESOURCE_RECORDER_TAG}"
     depends_on:
@@ -294,33 +294,6 @@ services:
       - DD_API_KEY=${DD_API_KEY}
       - DD_ENV=${DD_ENV}
       - HONEYCOMB_API_KEY=${HONEYCOMB_API_KEY}
-    deploy:
-      placement:
-        constraints:
-          - node.hostname==controller
-  panamax:
-    image: "${CONTAINER_REGISTRY}/panamax:${PANAMAX_TAG}"
-    restart: always
-    networks:
-      user-net:
-    volumes:
-      - panamax-crates-vol:/mirror/crates
-      - panamax-io-index-vol:/mirror/crates.io-index
-    labels:
-      deck-chores.sync-mirror.command: panamax sync /mirror
-      deck-chores.sync-mirror.interval: 5 minutes
-      deck-chores.sync-mirror.max: 1
-    deploy:
-      placement:
-        constraints:
-          - node.hostname==controller
-  deck-chores:
-    image: docker.io/funkyfuture/deck-chores:1
-    restart: unless-stopped
-    environment:
-      TIMEZONE: UTC
-    volumes:
-      - ${DOCKER_SOCK}:/var/run/docker.sock
     deploy:
       placement:
         constraints:

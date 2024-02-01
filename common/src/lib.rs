@@ -26,12 +26,13 @@ pub mod tracing;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 use std::fmt::Debug;
 
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "openapi")]
-use utoipa::openapi::{Object, ObjectBuilder};
 use zeroize::Zeroize;
 
 pub type ApiUrl = String;
@@ -160,17 +161,6 @@ impl DatabaseInfo {
             self.database_name,
         )
     }
-}
-
-#[cfg(feature = "openapi")]
-pub fn ulid_type() -> Object {
-    ObjectBuilder::new()
-        .schema_type(utoipa::openapi::SchemaType::String)
-        .format(Some(utoipa::openapi::SchemaFormat::Custom(
-            "ulid".to_string(),
-        )))
-        .description(Some("String represention of an Ulid according to the spec found here: https://github.com/ulid/spec."))
-        .build()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
