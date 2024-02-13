@@ -61,7 +61,7 @@ impl Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-#[derive(Debug, Clone, PartialEq, Error)]
+#[derive(Debug, Clone, PartialEq, Error, strum::IntoStaticStr)]
 pub enum ErrorKind {
     #[error("Request is missing a key")]
     KeyMissing,
