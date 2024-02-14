@@ -153,8 +153,8 @@ mod tests {
     use shuttle_proto::{
         builder::{builder_server::Builder, BuildRequest, BuildResponse},
         logger::{
-            logger_client::LoggerClient, logger_server::Logger, Batcher, LogLine, LogsRequest,
-            LogsResponse, StoreLogsRequest, StoreLogsResponse,
+            self, logger_server::Logger, Batcher, LogLine, LogsRequest, LogsResponse,
+            StoreLogsRequest, StoreLogsResponse,
         },
         provisioner::{
             provisioner_server::{Provisioner, ProvisionerServer},
@@ -360,13 +360,7 @@ mod tests {
     }
 
     async fn get_runtime_manager(
-        logger_client: Batcher<
-            LoggerClient<
-                shuttle_common::claims::ClaimService<
-                    shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-                >,
-            >,
-        >,
+        logger_client: Batcher<logger::Client>,
     ) -> Arc<tokio::sync::Mutex<RuntimeManager>> {
         let provisioner_addr =
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), pick_unused_port().unwrap());
@@ -388,10 +382,6 @@ mod tests {
     #[async_trait::async_trait]
     impl DeploymentUpdater for StubDeploymentUpdater {
         type Err = std::io::Error;
-
-        async fn set_address(&self, _id: &Uuid, _address: &SocketAddr) -> Result<(), Self::Err> {
-            Ok(())
-        }
 
         async fn set_is_next(&self, _id: &Uuid, _is_next: bool) -> Result<(), Self::Err> {
             Ok(())

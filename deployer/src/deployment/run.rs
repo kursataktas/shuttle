@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    future::Future,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -7,9 +8,8 @@ use std::{
 
 use async_trait::async_trait;
 use opentelemetry::global;
-use portpicker::pick_unused_port;
 use shuttle_common::{
-    claims::{Claim, ClaimService, InjectPropagation},
+    claims::Claim,
     constants::EXECUTABLE_DIRNAME,
     deployment::{
         DEPLOYER_END_MSG_COMPLETED, DEPLOYER_END_MSG_CRASHED, DEPLOYER_END_MSG_STARTUP_ERR,
@@ -20,15 +20,14 @@ use shuttle_common::{
 use shuttle_proto::{
     resource_recorder::record_request,
     runtime::{
-        runtime_client::RuntimeClient, LoadRequest, StartRequest, StopReason, SubscribeStopRequest,
-        SubscribeStopResponse,
+        self, LoadRequest, StartRequest, StopReason, SubscribeStopRequest, SubscribeStopResponse,
     },
 };
 use tokio::{
     sync::Mutex,
     task::{JoinHandle, JoinSet},
 };
-use tonic::{transport::Channel, Code};
+use tonic::Code;
 use tracing::{debug, debug_span, error, info, instrument, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
@@ -37,7 +36,7 @@ use uuid::Uuid;
 use super::{RunReceiver, State};
 use crate::{
     error::{Error, Result},
-    persistence::{resource::ResourceManager, DeploymentUpdater},
+    persistence::resource::ResourceManager,
     RuntimeManager,
 };
 
@@ -46,7 +45,6 @@ use crate::{
 pub async fn task(
     mut recv: RunReceiver,
     runtime_manager: Arc<Mutex<RuntimeManager>>,
-    deployment_updater: impl DeploymentUpdater,
     active_deployment_getter: impl ActiveDeploymentsGetter,
     resource_manager: impl ResourceManager,
     builds_path: PathBuf,
@@ -61,7 +59,6 @@ pub async fn task(
                 let id = built.id;
 
                 info!("Built deployment at the front of run queue: {id}");
-                let deployment_updater = deployment_updater.clone();
                 let resource_manager = resource_manager.clone();
                 let builds_path = builds_path.clone();
 
@@ -110,7 +107,6 @@ pub async fn task(
                             .handle(
                                 resource_manager,
                                 runtime_manager,
-                                deployment_updater,
                                 old_deployments_killer,
                                 cleanup,
                                 builds_path.as_path(),
@@ -231,7 +227,7 @@ pub struct Built {
 impl Built {
     #[instrument(
         name = "Loading resources",
-        skip(self, resource_manager, runtime_manager, deployment_updater, kill_old_deployments, cleanup),
+        skip(self, resource_manager, runtime_manager, kill_old_deployments, cleanup),
         fields(deployment_id = %self.id, state = %State::Loading)
     )]
     #[allow(clippy::too_many_arguments)]
@@ -239,8 +235,7 @@ impl Built {
         self,
         resource_manager: impl ResourceManager,
         runtime_manager: Arc<Mutex<RuntimeManager>>,
-        deployment_updater: impl DeploymentUpdater,
-        kill_old_deployments: impl futures::Future<Output = Result<()>>,
+        kill_old_deployments: impl Future<Output = Result<()>>,
         cleanup: impl FnOnce(Option<SubscribeStopResponse>) + Send + 'static,
         builds_path: &Path,
     ) -> Result<JoinHandle<()>> {
@@ -252,16 +247,8 @@ impl Built {
             .join(EXECUTABLE_DIRNAME)
             .join(self.id.to_string());
 
-        let port = match pick_unused_port() {
-            Some(port) => port,
-            None => {
-                return Err(Error::PrepareRun(
-                    "could not find a free port to deploy service on".to_string(),
-                ))
-            }
-        };
-
-        let address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+        // Let the runtime expose its user HTTP port on port 8000
+        let address = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8000);
 
         let alpha_runtime_path = if self.is_next {
             // The runtime client for next is the installed shuttle-next bin
@@ -300,7 +287,6 @@ impl Built {
             self.service_name,
             runtime_client,
             address,
-            deployment_updater,
             cleanup,
         ));
 
@@ -313,7 +299,7 @@ async fn load(
     service_id: Ulid,
     executable_path: PathBuf,
     mut resource_manager: impl ResourceManager,
-    mut runtime_client: RuntimeClient<ClaimService<InjectPropagation<Channel>>>,
+    mut runtime_client: runtime::Client,
     claim: Claim,
     mut secrets: HashMap<String, String>,
 ) -> Result<()> {
@@ -382,13 +368,15 @@ async fn load(
             let resources = response
                 .resources
                 .into_iter()
-                .map(|res| {
-                    let resource: resource::Response = serde_json::from_slice(&res).unwrap();
-                    record_request::Resource {
-                        r#type: resource.r#type.to_string(),
-                        config: resource.config.to_string().into_bytes(),
-                        data: resource.data.to_string().into_bytes(),
-                    }
+                .filter_map(|res| {
+                    // filter out resources with invalid types
+                    serde_json::from_slice::<resource::Response>(&res)
+                        .ok()
+                        .map(|r| record_request::Resource {
+                            r#type: r.r#type.to_string(),
+                            config: r.config.to_string().into_bytes(),
+                            data: r.data.to_string().into_bytes(),
+                        })
                 })
                 .collect();
             resource_manager
@@ -410,24 +398,14 @@ async fn load(
     }
 }
 
-#[instrument(name = "Starting service", skip(runtime_client, deployment_updater, cleanup), fields(deployment_id = %id, state = %State::Running))]
+#[instrument(name = "Starting service", skip(runtime_client, cleanup), fields(deployment_id = %id, state = %State::Running))]
 async fn run(
     id: Uuid,
     service_name: String,
-    mut runtime_client: RuntimeClient<ClaimService<InjectPropagation<Channel>>>,
+    mut runtime_client: runtime::Client,
     address: SocketAddr,
-    deployment_updater: impl DeploymentUpdater,
     cleanup: impl FnOnce(Option<SubscribeStopResponse>) + Send + 'static,
 ) {
-    if let Err(err) = deployment_updater.set_address(&id, &address).await {
-        // Clean up based on a stop response built outside the runtime
-        cleanup(Some(SubscribeStopResponse {
-            reason: StopReason::Crash as i32,
-            message: format!("errored while setting the new deployer address: {}", err),
-        }));
-        return;
-    }
-
     let start_request = tonic::Request::new(StartRequest {
         ip: address.to_string(),
     });
