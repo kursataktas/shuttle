@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use prost_types::Timestamp;
+use shuttle_common::models::error::emit_datadog_error;
 use shuttle_proto::logger::{LogItem, LogLine};
 use sqlx::{
     migrate::Migrator,
@@ -107,11 +108,11 @@ impl Postgres {
 
                         if let Err(error) = query.execute(&pool_spawn).instrument(parent_span).await
                         {
-                            error!(error = %error, "failed to insert logs");
+                            emit_datadog_error(error, "Sqlx");
                         };
                     }
-                    Err(err) => {
-                        error!(error = %err, "failed to receive message in database receiver");
+                    Err(error) => {
+                        emit_datadog_error(error, "ReceiverError");
                     }
                 }
             }

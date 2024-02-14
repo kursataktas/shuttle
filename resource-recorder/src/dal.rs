@@ -4,19 +4,19 @@ use crate::Error;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
-use shuttle_common::resource::Type;
+use shuttle_common::{models::error::emit_datadog_error, resource::Type};
 use shuttle_proto::resource_recorder::{self, record_request};
 use sqlx::{
     migrate::{MigrateDatabase, Migrator},
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteRow},
     FromRow, Row, SqlitePool,
 };
-use tracing::{error, info};
+use tracing::info;
 use ulid::Ulid;
 
 pub static MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, strum::IntoStaticStr)]
 pub enum DalError {
     Sqlx(#[from] sqlx::Error),
     ProjectId,
@@ -30,7 +30,7 @@ impl fmt::Display for DalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             DalError::Sqlx(error) => {
-                error!(error = error.to_string(), "database request failed");
+                emit_datadog_error(error, "Sqlx");
 
                 "failed to interact with recorder"
             }

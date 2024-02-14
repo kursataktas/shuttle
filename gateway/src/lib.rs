@@ -113,11 +113,11 @@ impl From<AcmeClientError> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let error_type = self.kind.to_string();
+        let error_type: &'static str = (&self.kind()).into();
         let error: ApiError = self.kind.into();
 
         if error.status_code >= 500 {
-            emit_datadog_error(&error, &error_type);
+            emit_datadog_error(&error, error_type);
         }
 
         error.into_response()

@@ -15,6 +15,7 @@ use shuttle_common::backends::auth::VerifyClaim;
 use shuttle_common::backends::client::gateway;
 use shuttle_common::backends::ClaimExt;
 use shuttle_common::claims::Scope;
+use shuttle_common::models::error::emit_datadog_error;
 use shuttle_common::models::project::ProjectName;
 pub use shuttle_proto::provisioner::provisioner_server::ProvisionerServer;
 use shuttle_proto::provisioner::{
@@ -28,7 +29,7 @@ use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tonic::transport::Uri;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 mod args;
 mod error;
@@ -495,10 +496,7 @@ impl Provisioner for ShuttleProvisioner {
                     {
                         Ok(can_provision) => can_provision,
                         Err(error) => {
-                            error!(
-                                error = &error as &dyn std::error::Error,
-                                "failed to check current RDS subscription"
-                            );
+                            emit_datadog_error(&error, (&error).into());
 
                             return Err(tonic::Status::internal(
                                 "failed to check current RDS subscription",

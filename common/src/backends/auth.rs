@@ -12,10 +12,13 @@ use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tower::{Layer, Service};
-use tracing::{error, trace, Span};
+use tracing::{error, info, trace, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-use crate::claims::{Claim, Scope};
+use crate::{
+    claims::{Claim, Scope},
+    models::error::emit_datadog_error,
+};
 
 use super::{
     cache::{CacheManagement, CacheManager},
@@ -264,10 +267,7 @@ where
                 match public_key_future.poll(cx) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Err(error)) => {
-                        error!(
-                            error = &error as &dyn std::error::Error,
-                            "failed to get public key from auth service"
-                        );
+                        emit_datadog_error(error, "PublicKeyError");
                         let response = Response::builder()
                             .status(StatusCode::SERVICE_UNAVAILABLE)
                             .body(Default::default())
@@ -279,6 +279,7 @@ where
                         let claim_result = Claim::from_token(bearer.token().trim(), &public_key);
                         match claim_result {
                             Err(code) => {
+                                // TODO: can we get an Error here?
                                 error!(code = %code, "failed to decode JWT");
 
                                 let response = Response::builder()
@@ -406,7 +407,7 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let Some(claim) = req.extensions().get::<Claim>() else {
-            error!("claim extension is not set");
+            info!("claim extension is not set");
 
             return StatusCodeFuture::Code(StatusCode::UNAUTHORIZED);
         };

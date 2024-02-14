@@ -14,7 +14,7 @@ mod resource_recorder;
 pub use gateway::ProjectsDal;
 pub use resource_recorder::ResourceDal;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, strum::IntoStaticStr)]
 pub enum Error {
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),

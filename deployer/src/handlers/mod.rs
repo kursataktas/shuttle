@@ -600,12 +600,12 @@ where
         state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
         let bytes = Bytes::from_request(req, state).await.map_err(|_| {
-            error!("failed to collect body bytes, is the body too large?");
+            info!("failed to collect body bytes, is the body too large?");
             StatusCode::PAYLOAD_TOO_LARGE
         })?;
 
         let t = rmp_serde::from_slice::<T>(&bytes).map_err(|error| {
-            error!(error = %error, "failed to deserialize request body");
+            info!(error = %error, "failed to deserialize request body");
             StatusCode::BAD_REQUEST
         })?;
 

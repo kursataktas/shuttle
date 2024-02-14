@@ -19,7 +19,7 @@ use tracing_subscriber::{fmt, prelude::*, registry::LookupSpan, EnvFilter};
 
 use crate::log::Backend;
 
-use super::otlp_tracing_bridge::{self};
+use super::otlp_tracing_bridge;
 
 const OTLP_ADDRESS: &str = "http://otel-collector:4317";
 

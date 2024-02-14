@@ -1,6 +1,6 @@
 use super::DeploymentState;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, strum::IntoStaticStr)]
 pub enum Error {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),

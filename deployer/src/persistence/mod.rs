@@ -4,7 +4,7 @@ use std::str::FromStr;
 use chrono::Utc;
 use error::{Error, Result};
 use hyper::Uri;
-use shuttle_common::{claims::Claim, resource::Type};
+use shuttle_common::{claims::Claim, models::error::emit_datadog_error, resource::Type};
 use shuttle_proto::{
     provisioner::{self, DatabaseRequest},
     resource_recorder::{
@@ -19,7 +19,7 @@ use sqlx::{
 };
 use tokio::task::JoinHandle;
 use tonic::Request;
-use tracing::{error, info, trace};
+use tracing::{info, trace};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -158,10 +158,7 @@ impl Persistence {
                 update_deployment(&pool, state)
                     .await
                     .unwrap_or_else(|error| {
-                        error!(
-                            error = &error as &dyn std::error::Error,
-                            "failed to update deployment state"
-                        )
+                        emit_datadog_error(&error, (&error).into());
                     });
             }
         });

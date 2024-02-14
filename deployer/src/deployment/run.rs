@@ -15,6 +15,7 @@ use shuttle_common::{
         DEPLOYER_END_MSG_COMPLETED, DEPLOYER_END_MSG_CRASHED, DEPLOYER_END_MSG_STARTUP_ERR,
         DEPLOYER_END_MSG_STOPPED, DEPLOYER_RUNTIME_START_RESPONSE,
     },
+    models::error::emit_datadog_error,
     resource, SecretStore,
 };
 use shuttle_proto::{
@@ -128,8 +129,8 @@ pub async fn task(
             Some(res) = set.join_next() => {
                 match res {
                     Ok(_) => (),
-                    Err(err) => {
-                        error!(error = %err, "an error happened while joining a deployment run task")
+                    Err(error) => {
+                        emit_datadog_error(error, "RunError");
                     }
                 }
 
@@ -182,6 +183,7 @@ fn crashed_cleanup(
     runtime_manager: Arc<Mutex<RuntimeManager>>,
     error: impl std::error::Error + 'static,
 ) {
+    // TODO: how do we handle these errors that are persisted in user logs?
     error!(
         error = &error as &dyn std::error::Error,
         "{}", DEPLOYER_END_MSG_CRASHED
@@ -196,6 +198,7 @@ fn crashed_cleanup(
 
 #[instrument(name = "Cleaning up startup crashed deployment", skip(_id), fields(deployment_id = %_id, state = %State::Crashed))]
 fn start_crashed_cleanup(_id: &Uuid, error: impl std::error::Error + 'static) {
+    // TODO: how do we handle these errors that are persisted in user logs?
     error!(
         error = &error as &dyn std::error::Error,
         "{}", DEPLOYER_END_MSG_STARTUP_ERR
@@ -318,6 +321,7 @@ async fn load(
         .filter_map(|resource| {
             resource
                 .map_err(|err| {
+                    // TODO: error here is just a string.
                     error!(error = ?err, "failed to parse resource data");
                 })
                 .ok()
@@ -333,7 +337,7 @@ async fn load(
                         secrets = combined;
                     }
                     Err(err) => {
-                        error!(error = ?err, "failed to parse old secrets data");
+                        emit_datadog_error(err, "SerdeError");
                     }
                 }
             }
@@ -450,8 +454,7 @@ async fn run(
                 message: status.to_string(),
             }));
         }
-        Err(ref status) => {
-            error!(%status, "failed to start service");
+        Err(_) => {
             start_crashed_cleanup(
                 &id,
                 Error::Start("runtime failed to start deployment".to_string()),
