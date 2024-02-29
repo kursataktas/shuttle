@@ -129,7 +129,6 @@ impl Visit for NewStateVisitor {
 mod tests {
     use std::{
         fs::read_dir,
-        net::{Ipv4Addr, SocketAddr},
         path::PathBuf,
         sync::{Arc, Mutex},
         time::Duration,
@@ -145,24 +144,24 @@ mod tests {
     use axum::body::Bytes;
     use ctor::ctor;
     use flate2::{write::GzEncoder, Compression};
-    use portpicker::pick_unused_port;
     use shuttle_common::claims::Claim;
-    use shuttle_common_tests::{builder::mocked_builder_client, logger::mocked_logger_client};
+    use shuttle_common_tests::{
+        logger::get_mocked_logger_client, provisioner::get_mocked_provisioner_client,
+    };
     use shuttle_proto::{
-        builder::{builder_server::Builder, BuildRequest, BuildResponse},
         logger::{
-            logger_client::LoggerClient, logger_server::Logger, Batcher, LogLine, LogsRequest,
-            LogsResponse, StoreLogsRequest, StoreLogsResponse,
+            self, logger_server::Logger, Batcher, LogLine, LogsRequest, LogsResponse,
+            StoreLogsRequest, StoreLogsResponse,
         },
         provisioner::{
-            provisioner_server::{Provisioner, ProvisionerServer},
-            DatabaseDeletionResponse, DatabaseRequest, DatabaseResponse, Ping, Pong,
+            provisioner_server::Provisioner, DatabaseDeletionResponse, DatabaseRequest,
+            DatabaseResponse, Ping, Pong,
         },
         resource_recorder::{ResourceResponse, ResourcesResponse, ResultResponse},
     };
     use tokio::{select, sync::mpsc, time::sleep};
     use tokio_stream::wrappers::ReceiverStream;
-    use tonic::{transport::Server, Request, Response, Status};
+    use tonic::{Request, Response, Status};
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     use ulid::Ulid;
     use uuid::Uuid;
@@ -272,16 +271,6 @@ mod tests {
         fn record(&self, _: LogItem) {}
     }
 
-    #[async_trait]
-    impl Builder for RecorderMock {
-        async fn build(
-            &self,
-            _request: tonic::Request<BuildRequest>,
-        ) -> Result<tonic::Response<BuildResponse>, tonic::Status> {
-            Ok(Response::new(BuildResponse::default()))
-        }
-    }
-
     #[derive(thiserror::Error, Debug)]
     pub enum MockError {}
 
@@ -350,26 +339,9 @@ mod tests {
     }
 
     async fn get_runtime_manager(
-        logger_client: Batcher<
-            LoggerClient<
-                shuttle_common::claims::ClaimService<
-                    shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-                >,
-            >,
-        >,
+        logger_client: Batcher<logger::Client>,
     ) -> Arc<tokio::sync::Mutex<RuntimeManager>> {
-        let provisioner_addr =
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), pick_unused_port().unwrap());
-        tokio::spawn(async move {
-            let mock = ProvisionerMock;
-            Server::builder()
-                .add_service(ProvisionerServer::new(mock))
-                .serve(provisioner_addr)
-                .await
-                .unwrap();
-        });
-
-        RuntimeManager::new(format!("http://{}", provisioner_addr), logger_client, None)
+        RuntimeManager::new(logger_client)
     }
 
     #[derive(Clone)]
@@ -378,10 +350,6 @@ mod tests {
     #[async_trait::async_trait]
     impl DeploymentUpdater for StubDeploymentUpdater {
         type Err = std::io::Error;
-
-        async fn set_address(&self, _id: &Uuid, _address: &SocketAddr) -> Result<(), Self::Err> {
-            Ok(())
-        }
 
         async fn set_is_next(&self, _id: &Uuid, _is_next: bool) -> Result<(), Self::Err> {
             Ok(())
@@ -411,14 +379,14 @@ mod tests {
         async fn get_slot(
             &self,
             _id: Uuid,
-        ) -> Result<bool, crate::deployment::gateway_client::Error> {
+        ) -> Result<bool, shuttle_common::backends::client::Error> {
             Ok(true)
         }
 
         async fn release_slot(
             &self,
             _id: Uuid,
-        ) -> Result<(), crate::deployment::gateway_client::Error> {
+        ) -> Result<(), shuttle_common::backends::client::Error> {
             Ok(())
         }
     }
@@ -799,18 +767,17 @@ mod tests {
     }
 
     async fn get_deployment_manager() -> DeploymentManager {
-        let logger_client = mocked_logger_client(RecorderMock::new()).await;
-        let builder_client = mocked_builder_client(RecorderMock::new()).await;
+        let logger_client = get_mocked_logger_client(RecorderMock::new()).await;
         DeploymentManager::builder()
             .build_log_recorder(RECORDER.clone())
             .active_deployment_getter(StubActiveDeploymentGetter)
             .artifacts_path(PathBuf::from("/tmp"))
             .resource_manager(StubResourceManager)
             .log_fetcher(logger_client.clone())
-            .builder_client(Some(builder_client))
             .runtime(get_runtime_manager(Batcher::wrap(logger_client)).await)
             .deployment_updater(StubDeploymentUpdater)
             .queue_client(StubBuildQueueClient)
+            .provisioner_client(get_mocked_provisioner_client(ProvisionerMock).await)
             .build()
     }
 

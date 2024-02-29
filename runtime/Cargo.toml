@@ -1,6 +1,6 @@
 [package]
 name = "shuttle-runtime"
-version = "0.36.0"
+version = "0.39.0"
 edition.workspace = true
 license.workspace = true
 description = "Runtime to start and manage any service that runs on shuttle"
@@ -14,8 +14,8 @@ doctest = false
 
 [dependencies]
 shuttle-codegen = { workspace = true, features = ["frameworks"] }
-shuttle-common = { workspace = true, features = ["backend", "claims"] }
-shuttle-proto = { workspace = true, features = ["provisioner", "runtime"] }
+shuttle-common = { workspace = true, features = ["extract_propagation"] }
+shuttle-proto = { workspace = true, features = ["runtime"] }
 shuttle-service = { workspace = true }
 
 anyhow = { workspace = true }
@@ -34,7 +34,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
-tower = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 wasi-common = { version = "13.0.0", optional = true }
 wasmtime = { version = "13.0.0", optional = true }
@@ -44,6 +43,7 @@ wasmtime-wasi = { version = "13.0.0", optional = true }
 portpicker = "0.1.1"
 futures = { workspace = true }
 shuttle-service = { workspace = true, features = ["builder", "runner"] }
+shuttle-proto = { workspace = true, features = ["provisioner"] }
 uuid = { workspace = true }
 
 [features]

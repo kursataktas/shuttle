@@ -1,10 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf};
 
 use clap::Parser;
-use fqdn::FQDN;
 use hyper::Uri;
 use shuttle_common::models::project::ProjectName;
-use tonic::transport::Endpoint;
 
 /// Program to handle the deploys for a single project
 /// Handling includes, building, testing, and running each service
@@ -21,19 +19,11 @@ pub struct Args {
 
     /// Address to connect to the logger service
     #[clap(long, default_value = "http://logger:8000")]
-    pub logger_uri: Endpoint,
-
-    /// FQDN where the proxy can be reached at
-    #[clap(long)]
-    pub proxy_fqdn: FQDN,
+    pub logger_uri: Uri,
 
     /// Address to bind API to
     #[clap(long, default_value = "0.0.0.0:8001")]
     pub api_address: SocketAddr,
-
-    /// Address to bind proxy to
-    #[clap(long, default_value = "0.0.0.0:8000")]
-    pub proxy_address: SocketAddr,
 
     /// Address to reach gateway's control plane at
     #[clap(long, default_value = "http://gateway:8001")]
@@ -58,10 +48,6 @@ pub struct Args {
     /// Address to reach the authentication service at
     #[clap(long, default_value = "http://auth:8000")]
     pub auth_uri: Uri,
-
-    /// Address to reach the builder service at
-    #[clap(long, default_value = "http://builder:8000")]
-    pub builder_uri: Endpoint,
 
     /// Uri to folder to store all artifacts
     #[clap(long, default_value = "/tmp")]

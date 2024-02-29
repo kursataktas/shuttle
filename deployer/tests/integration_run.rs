@@ -1,19 +1,16 @@
-use std::{
-    net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use portpicker::pick_unused_port;
 use shuttle_common::{claims::Claim, constants::EXECUTABLE_DIRNAME};
-use shuttle_common_tests::logger::{mocked_logger_client, MockedLogger};
+use shuttle_common_tests::{
+    logger::{get_mocked_logger_client, MockedLogger},
+    provisioner::get_mocked_provisioner_client,
+};
 use shuttle_proto::{
     logger::Batcher,
     provisioner::{
-        provisioner_server::{Provisioner, ProvisionerServer},
-        DatabaseDeletionResponse, DatabaseRequest, DatabaseResponse, Ping, Pong,
+        provisioner_server::Provisioner, DatabaseDeletionResponse, DatabaseRequest,
+        DatabaseResponse, Ping, Pong,
     },
     resource_recorder::{ResourceResponse, ResourcesResponse, ResultResponse},
     runtime::{StopReason, SubscribeStopResponse},
@@ -23,15 +20,11 @@ use tokio::{
     sync::{oneshot, Mutex},
     time::sleep,
 };
-use tonic::transport::Server;
 use ulid::Ulid;
 use uuid::Uuid;
 
 use shuttle_deployer::{
-    deployment::Built,
-    error,
-    persistence::{resource::ResourceManager, DeploymentUpdater},
-    RuntimeManager,
+    deployment::Built, error, persistence::resource::ResourceManager, RuntimeManager,
 };
 
 const RESOURCES_PATH: &str = "tests/resources";
@@ -67,19 +60,9 @@ impl Provisioner for ProvisionerMock {
 }
 
 async fn get_runtime_manager() -> Arc<Mutex<RuntimeManager>> {
-    let provisioner_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), pick_unused_port().unwrap());
+    let logger_client = Batcher::wrap(get_mocked_logger_client(MockedLogger).await);
 
-    tokio::spawn(async move {
-        Server::builder()
-            .add_service(ProvisionerServer::new(ProvisionerMock))
-            .serve(provisioner_addr)
-            .await
-            .unwrap();
-    });
-
-    let logger_client = Batcher::wrap(mocked_logger_client(MockedLogger).await);
-
-    RuntimeManager::new(format!("http://{}", provisioner_addr), logger_client, None)
+    RuntimeManager::new(logger_client)
 }
 
 #[derive(Clone)]
@@ -139,22 +122,6 @@ impl ResourceManager for StubResourceManager {
     }
 }
 
-#[derive(Clone)]
-struct StubDeploymentUpdater;
-
-#[async_trait]
-impl DeploymentUpdater for StubDeploymentUpdater {
-    type Err = std::io::Error;
-
-    async fn set_address(&self, _id: &Uuid, _address: &SocketAddr) -> Result<(), Self::Err> {
-        Ok(())
-    }
-
-    async fn set_is_next(&self, _id: &Uuid, _is_next: bool) -> Result<(), Self::Err> {
-        Ok(())
-    }
-}
-
 // This test uses the kill signal to make sure a service does stop when asked to
 #[tokio::test]
 async fn can_be_killed() {
@@ -178,10 +145,10 @@ async fn can_be_killed() {
         .handle(
             StubResourceManager,
             runtime_manager.clone(),
-            StubDeploymentUpdater,
             kill_old_deployments(),
             handle_cleanup,
             path.as_path(),
+            get_mocked_provisioner_client(ProvisionerMock).await,
         )
         .await
         .unwrap();
@@ -220,10 +187,10 @@ async fn self_stop() {
         .handle(
             StubResourceManager,
             runtime_manager.clone(),
-            StubDeploymentUpdater,
             kill_old_deployments(),
             handle_cleanup,
             path.as_path(),
+            get_mocked_provisioner_client(ProvisionerMock).await,
         )
         .await
         .unwrap();
@@ -231,6 +198,71 @@ async fn self_stop() {
     tokio::select! {
         _ = sleep(Duration::from_secs(5)) => panic!("cleanup should have been called as service stopped on its own"),
         Ok(()) = cleanup_recv => {},
+    }
+
+    // Prevent the runtime manager from dropping earlier, which will kill the processes it manages
+    drop(runtime_manager);
+}
+
+// Test for panics in the resource builder functions
+#[tokio::test]
+#[should_panic(expected = "Load(\"load panic\")")]
+async fn panic_in_load() {
+    let (built, path) = make_and_built("load-panic").await;
+    let runtime_manager = get_runtime_manager().await;
+
+    let handle_cleanup = |_result| panic!("service should never be started");
+
+    let x = built
+        .handle(
+            StubResourceManager,
+            runtime_manager.clone(),
+            kill_old_deployments(),
+            handle_cleanup,
+            path.as_path(),
+            get_mocked_provisioner_client(ProvisionerMock).await,
+        )
+        .await;
+    println!("{:?}", x);
+
+    x.unwrap();
+}
+
+// Test for panics in the main function
+#[tokio::test]
+async fn panic_in_main() {
+    let (built, path) = make_and_built("main-panic").await;
+    let runtime_manager = get_runtime_manager().await;
+    let (cleanup_send, cleanup_recv) = oneshot::channel();
+
+    let handle_cleanup = |response: Option<SubscribeStopResponse>| {
+        let response = response.unwrap();
+        match (
+            StopReason::try_from(response.reason).unwrap(),
+            response.message,
+        ) {
+            (StopReason::Crash, mes) if mes.contains("panic in main") => {
+                cleanup_send.send(()).unwrap()
+            }
+            (_, mes) => panic!("expected stop due to crash: {mes}"),
+        }
+    };
+
+    built
+        .handle(
+            StubResourceManager,
+            runtime_manager.clone(),
+            kill_old_deployments(),
+            handle_cleanup,
+            path.as_path(),
+            get_mocked_provisioner_client(ProvisionerMock).await,
+        )
+        .await
+        .unwrap();
+
+    tokio::select! {
+        _ = sleep(Duration::from_secs(5)) => panic!("cleanup should have been called as service handle stopped after panic"),
+        Ok(()) = cleanup_recv => {}
     }
 
     // Prevent the runtime manager from dropping earlier, which will kill the processes it manages
@@ -261,10 +293,10 @@ async fn panic_in_bind() {
         .handle(
             StubResourceManager,
             runtime_manager.clone(),
-            StubDeploymentUpdater,
             kill_old_deployments(),
             handle_cleanup,
             path.as_path(),
+            get_mocked_provisioner_client(ProvisionerMock).await,
         )
         .await
         .unwrap();
@@ -278,36 +310,16 @@ async fn panic_in_bind() {
     drop(runtime_manager);
 }
 
-// Test for panics in the main function
-#[tokio::test]
-#[should_panic(expected = "Load(\"main panic\")")]
-async fn panic_in_main() {
-    let (built, path) = make_and_built("main-panic").await;
-    let runtime_manager = get_runtime_manager().await;
-
-    let handle_cleanup = |_result| panic!("service should never be started");
-
-    let x = built
-        .handle(
-            StubResourceManager,
-            runtime_manager.clone(),
-            StubDeploymentUpdater,
-            kill_old_deployments(),
-            handle_cleanup,
-            path.as_path(),
-        )
-        .await;
-    println!("{:?}", x);
-
-    x.unwrap();
-}
-
 async fn make_and_built(crate_name: &str) -> (Built, PathBuf) {
+    // relative to deployer crate root
     let crate_dir: PathBuf = [RESOURCES_PATH, crate_name].iter().collect();
+    let target_dir: PathBuf = [RESOURCES_PATH, "target"].iter().collect();
 
     Command::new("cargo")
         .args(["build"])
         .current_dir(&crate_dir)
+        // Let all tests compile against the same target dir, since their dependency trees are identical
+        .env("CARGO_TARGET_DIR", "../target") // relative to current_dir
         .spawn()
         .unwrap()
         .wait()
@@ -321,7 +333,7 @@ async fn make_and_built(crate_name: &str) -> (Built, PathBuf) {
     };
 
     let id = Uuid::new_v4();
-    let exe_path = crate_dir.join("target/debug").join(bin_name);
+    let exe_path = target_dir.join("debug").join(bin_name);
     let new_dir = crate_dir.join(EXECUTABLE_DIRNAME);
     let new_exe_path = new_dir.join(id.to_string());
 
@@ -335,7 +347,12 @@ async fn make_and_built(crate_name: &str) -> (Built, PathBuf) {
             project_id: Ulid::new(),
             tracing_context: Default::default(),
             is_next: false,
-            claim: Default::default(),
+            claim: Some(Claim::new(
+                "test".into(),
+                Vec::new(),
+                shuttle_common::claims::AccountTier::Basic,
+                shuttle_common::claims::AccountTier::Basic,
+            )),
             secrets: Default::default(),
         },
         RESOURCES_PATH.into(), // is later joined with `service_name` to arrive at `crate_name`

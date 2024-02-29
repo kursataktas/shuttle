@@ -1,8 +1,7 @@
+use shuttle_common::backends;
 use std::error::Error as StdError;
 use std::io;
 use thiserror::Error;
-
-use crate::deployment::gateway_client;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -12,6 +11,8 @@ pub enum Error {
     Build(#[source] Box<dyn StdError + Send>),
     #[error("Load error: {0}")]
     Load(String),
+    #[error("Failed during provisioning: {0}")]
+    Provision(#[source] anyhow::Error),
     #[error("Prepare to run error: {0}")]
     PrepareRun(String),
     #[error("Run error: {0}")]
@@ -29,7 +30,7 @@ pub enum Error {
     #[error("Failed to cleanup old deployments: {0}")]
     OldCleanup(#[source] Box<dyn StdError + Send>),
     #[error("Gateway client error: {0}")]
-    GatewayClient(#[from] gateway_client::Error),
+    GatewayClient(#[from] backends::client::Error),
     #[error("Failed to get runtime: {0}")]
     Runtime(#[source] anyhow::Error),
     #[error("Failed to call start on runtime: {0}")]

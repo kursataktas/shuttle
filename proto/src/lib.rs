@@ -5,20 +5,24 @@ pub use prost;
 pub use prost_types;
 pub use tonic;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 #[cfg(feature = "provisioner")]
 pub mod provisioner {
-    use std::fmt::Display;
+    pub use super::generated::provisioner::*;
+
+    #[cfg(feature = "provisioner-client")]
+    pub use super::_provisioner_client::*;
 
     use shuttle_common::{
         database::{self, AwsRdsEngine, SharedEngine},
-        DatabaseReadyInfo,
+        DatabaseInfo,
     };
 
-    pub use super::generated::provisioner::*;
-
-    impl From<DatabaseResponse> for DatabaseReadyInfo {
+    impl From<DatabaseResponse> for DatabaseInfo {
         fn from(response: DatabaseResponse) -> Self {
-            DatabaseReadyInfo::new(
+            DatabaseInfo::new(
                 response.engine,
                 response.username,
                 response.password,
@@ -87,7 +91,7 @@ pub mod provisioner {
         }
     }
 
-    impl Display for aws_rds::Engine {
+    impl std::fmt::Display for aws_rds::Engine {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Self::Mariadb(_) => write!(f, "mariadb"),
@@ -98,17 +102,102 @@ pub mod provisioner {
     }
 }
 
+#[cfg(feature = "provisioner-client")]
+mod _provisioner_client {
+    use super::provisioner::*;
+
+    use http::Uri;
+
+    pub type Client = provisioner_client::ProvisionerClient<
+        shuttle_common::claims::ClaimService<
+            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
+        >,
+    >;
+
+    /// Get a provisioner client that is correctly configured for all services
+    pub async fn get_client(provisioner_uri: Uri) -> Client {
+        let channel = tonic::transport::Endpoint::from(provisioner_uri)
+            .connect()
+            .await
+            .expect("failed to connect to provisioner");
+
+        let provisioner_service = tower::ServiceBuilder::new()
+            .layer(shuttle_common::claims::ClaimLayer)
+            .layer(shuttle_common::claims::InjectPropagationLayer)
+            .service(channel);
+
+        Client::new(provisioner_service)
+    }
+}
+
 #[cfg(feature = "runtime")]
 pub mod runtime {
     pub use super::generated::runtime::*;
+
+    #[cfg(feature = "runtime-client")]
+    pub use super::_runtime_client::*;
+}
+
+#[cfg(feature = "runtime-client")]
+mod _runtime_client {
+    use super::runtime::*;
+
+    use std::time::Duration;
+
+    use anyhow::Context;
+    use tonic::transport::Endpoint;
+    use tracing::{info, trace};
+
+    pub type Client = runtime_client::RuntimeClient<
+        shuttle_common::claims::ClaimService<
+            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
+        >,
+    >;
+
+    /// Get a runtime client that is correctly configured
+    #[cfg(feature = "client")]
+    pub async fn get_client(port: &str) -> anyhow::Result<Client> {
+        info!("connecting runtime client");
+        let conn = Endpoint::new(format!("http://127.0.0.1:{port}"))
+            .context("creating runtime client endpoint")?
+            .connect_timeout(Duration::from_secs(5));
+
+        // Wait for the spawned process to open the control port.
+        // Connecting instantly does not give it enough time.
+        let channel = tokio::time::timeout(Duration::from_millis(7000), async move {
+            let mut ms = 5;
+            loop {
+                if let Ok(channel) = conn.connect().await {
+                    break channel;
+                }
+                trace!("waiting for runtime control port to open");
+                // exponential backoff
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                ms *= 2;
+            }
+        })
+        .await
+        .context("runtime control port did not open in time")?;
+
+        let runtime_service = tower::ServiceBuilder::new()
+            .layer(shuttle_common::claims::ClaimLayer)
+            .layer(shuttle_common::claims::InjectPropagationLayer)
+            .service(channel);
+
+        Ok(Client::new(runtime_service))
+    }
 }
 
 #[cfg(feature = "resource-recorder")]
 pub mod resource_recorder {
-    use anyhow::Context;
+    pub use super::generated::resource_recorder::*;
+
+    #[cfg(feature = "resource-recorder-client")]
+    pub use super::_resource_recorder_client::*;
+
     use std::str::FromStr;
 
-    pub use super::generated::resource_recorder::*;
+    use anyhow::Context;
 
     impl TryFrom<record_request::Resource> for shuttle_common::resource::Response {
         type Error = anyhow::Error;
@@ -150,13 +239,170 @@ pub mod resource_recorder {
     }
 }
 
-#[cfg(feature = "builder")]
-pub mod builder {
-    pub use super::generated::builder::*;
+#[cfg(feature = "resource-recorder-client")]
+mod _resource_recorder_client {
+    use super::resource_recorder::*;
+
+    use async_trait::async_trait;
+    use http::{header::AUTHORIZATION, Uri};
+    use shuttle_common::backends::client::{self, ResourceDal};
+
+    pub type Client = super::resource_recorder::resource_recorder_client::ResourceRecorderClient<
+        shuttle_common::claims::ClaimService<
+            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
+        >,
+    >;
+
+    /// Get a resource recorder client that is correctly configured for all services
+    pub async fn get_client(resource_recorder_uri: Uri) -> Client {
+        let channel = tonic::transport::Endpoint::from(resource_recorder_uri)
+            .connect()
+            .await
+            .expect("failed to connect to resource recorder");
+
+        let resource_recorder_service = tower::ServiceBuilder::new()
+            .layer(shuttle_common::claims::ClaimLayer)
+            .layer(shuttle_common::claims::InjectPropagationLayer)
+            .service(channel);
+
+        Client::new(resource_recorder_service)
+    }
+
+    #[async_trait]
+    impl ResourceDal for Client {
+        async fn get_project_resources(
+            &mut self,
+            project_id: &str,
+            token: &str,
+        ) -> Result<Vec<shuttle_common::resource::Response>, client::Error> {
+            let mut req = tonic::Request::new(ProjectResourcesRequest {
+                project_id: project_id.to_string(),
+            });
+
+            req.metadata_mut().insert(
+                AUTHORIZATION.as_str(),
+                format!("Bearer {token}")
+                    .parse()
+                    .expect("to construct a bearer token"),
+            );
+
+            let resp = (*self)
+                .get_project_resources(req)
+                .await?
+                .into_inner()
+                .clone();
+
+            let resources = resp
+                .resources
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error: anyhow::Error| tonic::Status::internal(error.to_string()))?;
+
+            Ok(resources)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use async_trait::async_trait;
+        use serde_json::json;
+        use shuttle_common::{database, resource};
+        use test_context::{test_context, AsyncTestContext};
+        use tonic::Request;
+
+        use crate::generated::resource_recorder::{record_request, RecordRequest};
+        use crate::test_utils::resource_recorder::get_mocked_resource_recorder;
+
+        use super::{get_client, Client, ResourceDal};
+
+        #[async_trait]
+        impl AsyncTestContext for Client {
+            async fn setup() -> Self {
+                let port = get_mocked_resource_recorder().await;
+
+                get_client(format!("http://localhost:{port}").parse().unwrap()).await
+            }
+
+            async fn teardown(mut self) {}
+        }
+
+        #[test_context(Client)]
+        #[tokio::test]
+        async fn get_project_resources(mut r_r_client: &mut Client) {
+            // First record some resources
+            r_r_client
+                .record_resources(Request::new(RecordRequest {
+                    project_id: "project_1".to_string(),
+                    service_id: "service_1".to_string(),
+                    resources: vec![
+                        record_request::Resource {
+                            r#type: "database::shared::postgres".to_string(),
+                            config: serde_json::to_vec(&json!({"public": true})).unwrap(),
+                            data: serde_json::to_vec(&json!({"username": "test"})).unwrap(),
+                        },
+                        record_request::Resource {
+                            r#type: "database::aws_rds::mariadb".to_string(),
+                            config: serde_json::to_vec(&json!({})).unwrap(),
+                            data: serde_json::to_vec(&json!({"username": "maria"})).unwrap(),
+                        },
+                    ],
+                }))
+                .await
+                .unwrap();
+
+            let resources = (&mut r_r_client as &mut dyn ResourceDal)
+                .get_project_resources("project_1", "user-1")
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resources,
+                vec![
+                    resource::Response {
+                        r#type: resource::Type::Database(database::Type::Shared(
+                            database::SharedEngine::Postgres
+                        )),
+                        config: json!({"public": true}),
+                        data: json!({"username": "test"}),
+                    },
+                    resource::Response {
+                        r#type: resource::Type::Database(database::Type::AwsRds(
+                            database::AwsRdsEngine::MariaDB
+                        )),
+                        config: json!({}),
+                        data: json!({"username": "maria"}),
+                    }
+                ]
+            );
+
+            // Getting only RDS resources should filter correctly
+            let resources = (&mut r_r_client as &mut dyn ResourceDal)
+                .get_project_rds_resources("project_1", "user-1")
+                .await
+                .unwrap();
+
+            assert_eq!(
+                resources,
+                vec![resource::Response {
+                    r#type: resource::Type::Database(database::Type::AwsRds(
+                        database::AwsRdsEngine::MariaDB
+                    )),
+                    config: json!({}),
+                    data: json!({"username": "maria"}),
+                }]
+            );
+        }
+    }
 }
 
 #[cfg(feature = "logger")]
 pub mod logger {
+    pub use super::generated::logger::*;
+
+    #[cfg(feature = "logger-client")]
+    pub use super::_logger_client::*;
+
     use std::str::FromStr;
     use std::time::Duration;
 
@@ -174,8 +420,6 @@ pub mod logger {
         log::{Backend, LogItem as LogItemCommon, LogRecorder},
         DeploymentId,
     };
-
-    pub use super::generated::logger::*;
 
     impl From<LogItemCommon> for LogItem {
         fn from(value: LogItemCommon) -> Self {
@@ -414,5 +658,32 @@ pub mod logger {
             sleep(Duration::from_millis(500)).await;
             assert_eq!(*mock.0.lock().unwrap(), Some(vec![1]));
         }
+    }
+}
+#[cfg(feature = "logger-client")]
+mod _logger_client {
+    use super::logger::*;
+
+    use http::Uri;
+
+    pub type Client = logger_client::LoggerClient<
+        shuttle_common::claims::ClaimService<
+            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
+        >,
+    >;
+
+    /// Get a logger client that is correctly configured for all services
+    pub async fn get_client(logger_uri: Uri) -> Client {
+        let channel = tonic::transport::Endpoint::from(logger_uri)
+            .connect()
+            .await
+            .expect("failed to connect to logger");
+
+        let logger_service = tower::ServiceBuilder::new()
+            .layer(shuttle_common::claims::ClaimLayer)
+            .layer(shuttle_common::claims::InjectPropagationLayer)
+            .service(channel);
+
+        Client::new(logger_service)
     }
 }

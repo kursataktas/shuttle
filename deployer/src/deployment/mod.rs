@@ -4,7 +4,7 @@ use std::{
 };
 
 use shuttle_common::log::LogRecorder;
-use shuttle_proto::{builder::builder_client::BuilderClient, logger::logger_client::LoggerClient};
+use shuttle_proto::{logger, provisioner};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinSet,
@@ -31,26 +31,14 @@ const RUN_BUFFER_SIZE: usize = 100;
 
 pub struct DeploymentManagerBuilder<LR, ADG, DU, RM, QC> {
     build_log_recorder: Option<LR>,
-    logs_fetcher: Option<
-        LoggerClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    logs_fetcher: Option<logger::Client>,
     active_deployment_getter: Option<ADG>,
     artifacts_path: Option<PathBuf>,
     runtime_manager: Option<Arc<Mutex<RuntimeManager>>>,
     deployment_updater: Option<DU>,
     resource_manager: Option<RM>,
     queue_client: Option<QC>,
-    builder_client: Option<
-        BuilderClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    provisioner_client: Option<provisioner::Client>,
 }
 
 impl<LR, ADG, DU, RM, QC> DeploymentManagerBuilder<LR, ADG, DU, RM, QC>
@@ -67,30 +55,14 @@ where
         self
     }
 
-    pub fn log_fetcher(
-        mut self,
-        logs_fetcher: LoggerClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    ) -> Self {
+    pub fn log_fetcher(mut self, logs_fetcher: logger::Client) -> Self {
         self.logs_fetcher = Some(logs_fetcher);
 
         self
     }
 
-    pub fn builder_client(
-        mut self,
-        builder_client: Option<
-            BuilderClient<
-                shuttle_common::claims::ClaimService<
-                    shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-                >,
-            >,
-        >,
-    ) -> Self {
-        self.builder_client = builder_client;
+    pub fn provisioner_client(mut self, provisioner_client: provisioner::Client) -> Self {
+        self.provisioner_client = Some(provisioner_client);
 
         self
     }
@@ -150,6 +122,9 @@ where
             .expect("a deployment updater to be set");
         let resource_manager = self.resource_manager.expect("a resource manager to be set");
         let logs_fetcher = self.logs_fetcher.expect("a logs fetcher to be set");
+        let provisioner_client = self
+            .provisioner_client
+            .expect("a provisioner client to be set");
 
         let (queue_send, queue_recv) = mpsc::channel(QUEUE_BUFFER_SIZE);
         let (run_send, run_recv) = mpsc::channel(RUN_BUFFER_SIZE);
@@ -163,20 +138,19 @@ where
         set.spawn(queue::task(
             queue_recv,
             run_send_clone,
-            deployment_updater.clone(),
+            deployment_updater,
             build_log_recorder,
             queue_client,
-            self.builder_client,
             builds_path.clone(),
         ));
         // Run queue. Waits for built deployments and runs them.
         set.spawn(run::task(
             run_recv,
             runtime_manager.clone(),
-            deployment_updater,
             active_deployment_getter,
             resource_manager,
             builds_path.clone(),
+            provisioner_client,
         ));
 
         DeploymentManager {
@@ -195,11 +169,7 @@ pub struct DeploymentManager {
     queue_send: QueueSender,
     run_send: RunSender,
     runtime_manager: Arc<Mutex<RuntimeManager>>,
-    logs_fetcher: LoggerClient<
-        shuttle_common::claims::ClaimService<
-            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-        >,
-    >,
+    logs_fetcher: logger::Client,
     _join_set: Arc<Mutex<JoinSet<()>>>,
     builds_path: PathBuf,
 }
@@ -231,7 +201,7 @@ impl DeploymentManager {
             deployment_updater: None,
             resource_manager: None,
             queue_client: None,
-            builder_client: None,
+            provisioner_client: None,
         }
     }
 
@@ -259,13 +229,7 @@ impl DeploymentManager {
         self.builds_path.as_path()
     }
 
-    pub fn logs_fetcher(
-        &self,
-    ) -> &LoggerClient<
-        shuttle_common::claims::ClaimService<
-            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-        >,
-    > {
+    pub fn logs_fetcher(&self) -> &logger::Client {
         &self.logs_fetcher
     }
 }

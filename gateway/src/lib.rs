@@ -23,7 +23,6 @@ use shuttle_common::models::error::{ApiError, ErrorKind};
 use shuttle_common::models::project::ProjectName;
 use strum::Display;
 use tokio::sync::mpsc::error::SendError;
-use tracing::error;
 
 pub mod acme;
 pub mod api;
@@ -114,9 +113,14 @@ impl From<AcmeClientError> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        error!(error = %self, "request had an error");
+        let error: ApiError = self.kind.clone().into();
 
-        let error: ApiError = self.kind.into();
+        if error.status_code >= 500 {
+            tracing::error!(
+                error = &self as &dyn std::error::Error,
+                "control plane request error"
+            );
+        }
 
         error.into_response()
     }
@@ -295,7 +299,7 @@ pub mod tests {
     use shuttle_common::claims::{AccountTier, Claim};
     use shuttle_common::models::deployment::DeploymentRequest;
     use shuttle_common::models::{project, service};
-    use shuttle_common_tests::resource_recorder::start_mocked_resource_recorder;
+    use shuttle_proto::test_utils::resource_recorder::get_mocked_resource_recorder;
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{query, SqlitePool};
     use test_context::AsyncTestContext;
@@ -534,7 +538,7 @@ pub mod tests {
             let bouncer = format!("127.0.0.1:{bouncer}").parse().unwrap();
             let auth: SocketAddr = format!("0.0.0.0:{auth_port}").parse().unwrap();
             let auth_uri: Uri = format!("http://{auth}").parse().unwrap();
-            let resource_recorder_port = start_mocked_resource_recorder().await;
+            let resource_recorder_port = get_mocked_resource_recorder().await;
 
             let auth_service = AuthService::new(auth);
             auth_service
@@ -555,7 +559,6 @@ pub mod tests {
                 env::var("SHUTTLE_TESTS_NETWORK").unwrap_or_else(|_| "shuttle_default".to_string());
 
             let provisioner_host = "provisioner".to_string();
-            let builder_host = "builder".to_string();
 
             let docker_host = "/var/run/docker.sock".to_string();
 
@@ -569,7 +572,6 @@ pub mod tests {
                     image,
                     prefix,
                     provisioner_host,
-                    builder_host,
                     // The started containers need to reach auth on the host.
                     // For this to work, the firewall should not be blocking traffic on the `SHUTTLE_TEST_NETWORK` interface.
                     // The following command can be used on NixOs to allow traffic on the interface.

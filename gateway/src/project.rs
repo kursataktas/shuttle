@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::convert::{identity, Infallible};
+use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -13,7 +13,6 @@ use bollard::network::{ConnectNetworkOptions, DisconnectNetworkOptions};
 use bollard::service::MountTypeEnum;
 use bollard::system::EventsOptions;
 use bollard::volume::RemoveVolumeOptions;
-use fqdn::FQDN;
 use futures::prelude::*;
 use http::header::AUTHORIZATION;
 use http::uri::InvalidUri;
@@ -148,12 +147,6 @@ pub trait ContainerInspectResponseExt {
         Ok(safe_unwrap!(container.args))
     }
 
-    fn fqdn(&self) -> Result<FQDN, ProjectError> {
-        self.find_arg_and_then("--proxy-fqdn", identity)?
-            .parse()
-            .map_err(|_| ProjectError::internal("invalid value for --proxy-fqdn"))
-    }
-
     fn initial_key(&self) -> Result<String, ProjectError> {
         self.find_arg_and_then("--admin-secret", str::to_owned)
     }
@@ -167,7 +160,10 @@ impl ContainerInspectResponseExt for ContainerInspectResponse {
 
 impl From<DockerError> for Error {
     fn from(err: DockerError) -> Self {
-        error!(error = %err, "internal Docker error");
+        error!(
+            error = &err as &dyn std::error::Error,
+            "internal Docker error"
+        );
         Self::source(ErrorKind::Internal, err)
     }
 }
@@ -732,8 +728,6 @@ pub struct ProjectCreating {
     project_id: Ulid,
     /// The admin secret with which the start deployer
     initial_key: String,
-    /// Override the default fqdn (`${project_name}.${public}`)
-    fqdn: Option<String>,
     /// Override the default image (specified in the args to this gateway)
     image: Option<String>,
     /// Configuration will be extracted from there if specified (will
@@ -758,7 +752,6 @@ impl ProjectCreating {
             project_name,
             project_id,
             initial_key,
-            fqdn: None,
             image: None,
             from: None,
             recreate_count: 0,
@@ -779,7 +772,6 @@ impl ProjectCreating {
             project_name,
             project_id,
             initial_key,
-            fqdn: None,
             image: None,
             from: Some(container),
             recreate_count,
@@ -789,11 +781,6 @@ impl ProjectCreating {
 
     pub fn from(mut self, from: ContainerInspectResponse) -> Self {
         self.from = Some(from);
-        self
-    }
-
-    pub fn with_fqdn(mut self, fqdn: String) -> Self {
-        self.fqdn = Some(fqdn);
         self
     }
 
@@ -817,10 +804,6 @@ impl ProjectCreating {
 
     pub fn initial_key(&self) -> &str {
         &self.initial_key
-    }
-
-    pub fn fqdn(&self) -> &Option<String> {
-        &self.fqdn
     }
 
     fn container_name<C: DockerContext>(&self, ctx: &C) -> String {
@@ -847,10 +830,8 @@ impl ProjectCreating {
             image: default_image,
             prefix,
             provisioner_host,
-            builder_host,
             auth_uri,
             resource_recorder_uri,
-            fqdn: public,
             extra_hosts,
             ..
         } = ctx.container_settings();
@@ -858,7 +839,6 @@ impl ProjectCreating {
         let Self {
             initial_key,
             project_name,
-            fqdn,
             image,
             idle_minutes,
             ..
@@ -892,18 +872,12 @@ impl ProjectCreating {
                         format!("0.0.0.0:{RUNTIME_API_PORT}"),
                         "--provisioner-address",
                         format!("http://{provisioner_host}:8000"),
-                        "--proxy-address",
-                        "0.0.0.0:8000",
-                        "--proxy-fqdn",
-                        fqdn.clone().unwrap_or(format!("{project_name}.{public}")),
                         "--artifacts-path",
                         "/opt/shuttle",
                         "--state",
                         "/opt/shuttle/deployer.sqlite",
                         "--auth-uri",
                         auth_uri,
-                        "--builder-uri",
-                        format!("http://{builder_host}:8000"),
                         "--resource-recorder",
                         resource_recorder_uri,
                         "--project-id",
@@ -932,10 +906,9 @@ impl ProjectCreating {
         // TODO: remove the config from the log message, add that into the span attributes as a
         // serialized JSON.
         debug!(
-            r"generated a container configuration:
-CreateContainerOpts: {create_container_options:#?}
-Config: {config:#?}
-"
+            ?create_container_options,
+            ?config,
+            "generated a container configuration"
         );
 
         (create_container_options, config)
@@ -1395,6 +1368,7 @@ where
         debug!(
             shuttle.container.id = container.id,
             shuttle.service.name = %service.name,
+            shuttle.project.name = %service.name,
             "{} has {} CPU usage per minute",
             service.name,
             cpu_per_minute
@@ -1438,7 +1412,10 @@ impl ProjectReady {
 
     pub async fn start_last_deploy(&mut self, jwt: String, admin_secret: String) {
         if let Err(error) = self.service.start_last_deploy(jwt, admin_secret).await {
-            error!(error, "failed to start last running deploy");
+            error!(
+                error = error.as_ref() as &dyn std::error::Error,
+                "failed to start last running deploy"
+            );
         };
     }
 }
@@ -1505,8 +1482,6 @@ impl Service {
         jwt: String,
         admin_secret: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        trace!(jwt, "getting last deploy");
-
         let running_id = self.get_running_deploy(&jwt, &admin_secret).await?;
 
         trace!(?running_id, "starting deploy");
@@ -1549,15 +1524,17 @@ impl Service {
 
         let resp = timeout(IS_HEALTHY_TIMEOUT, CLIENT.request(req)).await??;
 
-        let body = hyper::body::to_bytes(resp.into_body()).await?;
+        if resp.status() == 200 {
+            let body = hyper::body::to_bytes(resp.into_body()).await?;
 
-        let service: service::Summary = serde_json::from_slice(&body)?;
+            let service: service::Summary = serde_json::from_slice(&body)?;
 
-        if let Some(deployment) = service.deployment {
-            Ok(Some(deployment.id))
-        } else {
-            Ok(None)
+            if let Some(deployment) = service.deployment {
+                return Ok(Some(deployment.id));
+            }
         }
+
+        Ok(None)
     }
 }
 
@@ -1779,7 +1756,10 @@ impl std::error::Error for ProjectError {}
 
 impl From<DockerError> for ProjectError {
     fn from(err: DockerError) -> Self {
-        error!(error = %err, "an internal DockerError had to yield a ProjectError");
+        error!(
+            error = &err as &dyn std::error::Error,
+            "an internal DockerError had to yield a ProjectError"
+        );
         Self {
             kind: ProjectErrorKind::Internal,
             message: format!("{}", err),
@@ -1802,7 +1782,10 @@ impl From<InvalidUri> for ProjectError {
 
 impl From<hyper::Error> for ProjectError {
     fn from(err: hyper::Error) -> Self {
-        error!(error = %err, "failed to check project's health");
+        error!(
+            error = &err as &dyn std::error::Error,
+            "failed to check project's health"
+        );
 
         Self {
             kind: ProjectErrorKind::Internal,
@@ -2021,7 +2004,6 @@ pub mod tests {
                 project_name: "my-project-test".parse().unwrap(),
                 project_id: Ulid::new(),
                 initial_key: "test".to_string(),
-                fqdn: None,
                 image: None,
                 from: None,
                 recreate_count: 0,

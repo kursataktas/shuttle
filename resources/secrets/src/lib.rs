@@ -1,38 +1,25 @@
 #![doc = include_str!("../README.md")]
-
 use async_trait::async_trait;
-use serde::Serialize;
 pub use shuttle_service::SecretStore;
-use shuttle_service::{Error, Factory, ResourceBuilder, Type};
+use shuttle_service::{
+    resource::{ProvisionResourceRequest, ShuttleResourceOutput, Type},
+    Error, ResourceFactory, ResourceInputBuilder,
+};
 
-/// A struct that represents service secrets
-#[derive(Serialize)]
+/// Secrets plugin that provides service secrets
+#[derive(Default)]
 pub struct Secrets;
 
-/// Get a store with all the secrets available to a deployment
 #[async_trait]
-impl ResourceBuilder<SecretStore> for Secrets {
-    const TYPE: Type = Type::Secrets;
+impl ResourceInputBuilder for Secrets {
+    type Input = ProvisionResourceRequest;
+    type Output = ShuttleResourceOutput<SecretStore>;
 
-    type Config = ();
-
-    type Output = SecretStore;
-
-    fn new() -> Self {
-        Self {}
-    }
-
-    fn config(&self) -> &Self::Config {
-        &()
-    }
-
-    async fn output(self, factory: &mut dyn Factory) -> Result<Self::Output, crate::Error> {
-        let secrets = factory.get_secrets().await?;
-
-        Ok(SecretStore::new(secrets))
-    }
-
-    async fn build(build_data: &Self::Output) -> Result<SecretStore, crate::Error> {
-        Ok(build_data.clone())
+    async fn build(self, _factory: &ResourceFactory) -> Result<Self::Input, crate::Error> {
+        Ok(ProvisionResourceRequest::new(
+            Type::Secrets,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ))
     }
 }

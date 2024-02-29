@@ -51,7 +51,7 @@ graph BT
 
 - `cargo-shuttle` is the CLI used by users to initialize, deploy and manage their projects and services on Shuttle.
 - `gateway` starts and manages instances of `deployer`. It proxies commands from the user sent via the CLI on port 8001 and traffic on port 8000 to the correct instance of `deployer`.
-- `auth` is an authentication service that creates and manages users. In addition to that, requests to the `gateway` that contain an api-key or cookie will be proxied to the `auth` service where it will be converted to a JWT for authorization between internal services (like a `deployer` requesting a database from
+- `auth` is an authentication service that creates and manages users. In addition to that, requests to the `gateway` that contain an api-key will be proxied to the `auth` service where it will be converted to a JWT for authorization between internal services (like a `deployer` requesting a database from
 `provisioner`).
 - `deployer` is a service that runs in its own docker container, one per user project. It manages a project's deployments and state.
 - `provisioner` is a service used for requesting databases and other resources, using a gRPC API.
@@ -110,20 +110,15 @@ You should now be ready to setup a local environment to test code changes to cor
 From the root of the Shuttle repo, build the required images with:
 
 ```bash
-USE_PANAMAX=disable make images
+make images
 ```
 
-> Note: The stack uses [panamax](https://github.com/panamax-rs/panamax) by default to mirror crates.io content.
-> We do this in order to avoid overloading upstream mirrors and hitting rate limits.
-> After syncing the cache, expect to see the panamax volume take about 100GiB of space.
-> This may not be desirable for local testing. Therefore `USE_PANAMAX=disable make images` is recommended.
-
-The images get built with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) and therefore support incremental builds (most of the time). So they will be much faster to re-build after an incremental change in your code - should you wish to deploy it locally straight away.
+The images get built with [cargo-chef](https://github.com/LukeMathWalker/cargo-chef) and therefore support incremental builds (most of the time).
 
 You can now start a local deployment of Shuttle and the required containers with:
 
 ```bash
-USE_PANAMAX=disable make up
+make up
 ```
 
 > Note: `make up` can also be run with `SHUTTLE_DETACH=disable`, which means docker-compose will not be run with `--detach`. This is often desirable for local testing.
@@ -151,28 +146,17 @@ See the files [apply-patches.sh](./scripts/apply-patches.sh) and [patches.toml](
 > These should not be included in commits/PRs.
 > The easiest way to get rid of them is to comment out all the patch lines in `.cargo/config.toml`, and refresh cargo/r-a.
 
-### Create an admin user
+### Create an admin user + login
 
 Before we can login to our local instance of Shuttle, we need to create a user.
-The following command inserts a user into the `auth` state with admin privileges:
+The following script inserts a user into the `auth` state with admin privileges,
+and sets and env var to override your default api key with the admin test key.
+A shell prompt prefix is added to show that this api key override is active.
 
 ```bash
-# the --key needs to be 16 alphanumeric characters
-docker compose -f docker-compose.rendered.yml -p shuttle-dev exec auth /usr/local/bin/shuttle-auth --db-connection-uri=postgres://postgres:postgres@control-db init-admin --name admin --key dh9z58jttoes3qvt
+source scripts/local-admin.sh
+# If you have already done this before you will get a "UNIQUE constraint failed" error. It can be ignored.
 ```
-
-> Note: if you have done this already for this container you will get a "UNIQUE constraint failed"
-> error, you can ignore this.
-
-Login to Shuttle service in a new terminal window from the root of the Shuttle directory:
-
-```bash
-# the --api-key should be the same one you inserted in the auth state
-cargo run -p cargo-shuttle -- login --api-key dh9z58jttoes3qvt
-```
-
-> Note: The above commands, along with other useful scripts, can be found in [scripts](./scripts).
-> The above lines can instead be done with `source scripts/local-admin.sh`.
 
 Finally, before gateway will be able to work with some projects, we need to create a user for it.
 The following command inserts a gateway user into the `auth` state with deployer privileges:
@@ -213,13 +197,13 @@ The steps outlined above starts all the services used by Shuttle locally (ie. bo
 
 ```bash
 # if you didn't do this already, make the images
-USE_PANAMAX=disable make images
+make images
 
 # then generate the local docker-compose file
 make docker-compose.rendered.yml
 
 # then run
-docker compose -f docker-compose.rendered.yml up provisioner resource-recorder logger otel-collector builder
+docker compose -f docker-compose.rendered.yml up provisioner resource-recorder logger otel-collector
 ```
 
 This starts the provisioner and the auth service, while preventing `gateway` from starting up.
@@ -228,7 +212,7 @@ Make sure an admin user is inserted into auth and that the key is used by cargo-
 We're now ready to start a local run of the deployer:
 
 ```bash
-OTLP_ADDRESS=http://127.0.0.1:4317 cargo run -p shuttle-deployer -- --provisioner-address http://localhost:3000 --auth-uri http://localhost:8008 --resource-recorder http://localhost:8007 --builder-uri http://localhost:8009 --logger-uri http://localhost:8010 --proxy-fqdn local.rs --admin-secret dh9z58jttoes3qvt --local --project-id "01H7WHDK23XYGSESCBG6XWJ1V0" --project <name>
+OTLP_ADDRESS=http://127.0.0.1:4317 cargo run -p shuttle-deployer -- --provisioner-address http://localhost:3000 --auth-uri http://localhost:8008 --resource-recorder http://localhost:8007 --logger-uri http://localhost:8010 --proxy-fqdn local.rs --admin-secret dh9z58jttoes3qvt --local --project-id "01H7WHDK23XYGSESCBG6XWJ1V0" --project <name>
 ```
 
 The `<name>` needs to match the name of the project that will be deployed to this deployer.

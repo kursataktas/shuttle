@@ -43,5 +43,6 @@ message DatabaseResponse {
 }
 
 message DatabaseDeletionResponse {}
+
 message Ping {}
 message Pong {}

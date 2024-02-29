@@ -1,8 +1,7 @@
-pub mod builder;
 pub mod cargo_shuttle;
 pub mod logger;
 pub mod postgres;
-pub mod resource_recorder;
+pub mod provisioner;
 
 use shuttle_common::claims::{AccountTier, Claim, Scope};
 
@@ -63,5 +62,18 @@ where
             AccountTier::default(),
         ));
         self.inner.call(req)
+    }
+}
+
+pub trait ClaimTestsExt {
+    /// Fill the token of a test key correctly
+    fn fill_token(self) -> Self;
+}
+
+impl ClaimTestsExt for Claim {
+    fn fill_token(mut self) -> Self {
+        self.token = Some(self.sub.clone());
+
+        self
     }
 }

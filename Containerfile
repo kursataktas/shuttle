@@ -15,7 +15,6 @@ COPY . .
 # Select only the essential files for copying into next steps
 # so that changes to miscellaneous files don't trigger a new cargo-chef cook.
 # Beware that .dockerignore filters files before they get here.
-
 RUN find . \( \
     -name "*.rs" -or \
     -name "*.toml" -or \
@@ -26,8 +25,9 @@ RUN find . \( \
     -name "*.pem" \
     \) -type f -exec install -D \{\} /build/\{\} \;
 WORKDIR /build
+# Remove patch.unused entries as they trigger unnecessary rebuilds (don't ask how long it took to write)
+RUN N="$(grep -bPzo '(?s)\n\[\[patch.unused.*' Cargo.lock | grep -a : | cut -d: -f1)"; [ -z $N ] && exit 0; head -c $N Cargo.lock > Cargo.lock.nopatch && mv Cargo.lock.nopatch Cargo.lock
 RUN cargo chef prepare --recipe-path /recipe.json
-# TODO upstream: Reduce the cooking by allowing multiple --bin args to prepare, or like this https://github.com/LukeMathWalker/cargo-chef/issues/181
 
 
 # Builds crate according to cargo chef recipe.
@@ -39,13 +39,19 @@ COPY --from=chef-planner /recipe.json /
 RUN cargo chef cook \
     --all-features \
     $(if [ "$CARGO_PROFILE" = "release" ]; then echo --release; fi) \
-    --recipe-path /recipe.json
+    --recipe-path /recipe.json \
+    --bin shuttle-auth \
+    --bin shuttle-deployer \
+    --bin shuttle-gateway \
+    --bin shuttle-logger \
+    --bin shuttle-provisioner \
+    --bin shuttle-resource-recorder \
+    --bin shuttle-next
 COPY --from=chef-planner /build .
 # Building all at once to share build artifacts in the "cook" layer
 RUN cargo build \
     $(if [ "$CARGO_PROFILE" = "release" ]; then echo --release; fi) \
     --bin shuttle-auth \
-    --bin shuttle-builder \
     --bin shuttle-deployer \
     --bin shuttle-gateway \
     --bin shuttle-logger \
@@ -63,27 +69,19 @@ RUN apt update && apt install -y curl ca-certificates; rm -rf /var/lib/apt/lists
 
 #### AUTH
 FROM bookworm-20230904-slim-plus AS shuttle-auth
+ARG SHUTTLE_SERVICE_VERSION
+ENV SHUTTLE_SERVICE_VERSION=${SHUTTLE_SERVICE_VERSION}
 ARG CARGO_PROFILE
 COPY --from=chef-builder /build/target/${CARGO_PROFILE}/shuttle-auth /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/shuttle-auth"]
 FROM shuttle-auth AS shuttle-auth-dev
 
 
-#### BUILDER
-ARG RUSTUP_TOOLCHAIN
-FROM docker.io/library/rust:${RUSTUP_TOOLCHAIN}-bookworm AS shuttle-builder
-ARG CARGO_PROFILE
-ARG prepare_args
-COPY builder/prepare.sh /prepare.sh
-RUN /prepare.sh "${prepare_args}"
-COPY --from=chef-builder /build/target/${CARGO_PROFILE}/shuttle-builder /usr/local/bin
-ENTRYPOINT ["/usr/local/bin/shuttle-builder"]
-FROM shuttle-builder AS shuttle-builder-dev
-
-
 #### DEPLOYER
 ARG RUSTUP_TOOLCHAIN
 FROM docker.io/library/rust:${RUSTUP_TOOLCHAIN}-bookworm AS shuttle-deployer
+ARG SHUTTLE_SERVICE_VERSION
+ENV SHUTTLE_SERVICE_VERSION=${SHUTTLE_SERVICE_VERSION}
 ARG CARGO_PROFILE
 ARG prepare_args
 # Fixes some dependencies compiled with incompatible versions of rustc
@@ -115,6 +113,8 @@ COPY --from=chef-planner /build /usr/src/shuttle/
 
 #### GATEWAY
 FROM bookworm-20230904-slim-plus AS shuttle-gateway
+ARG SHUTTLE_SERVICE_VERSION
+ENV SHUTTLE_SERVICE_VERSION=${SHUTTLE_SERVICE_VERSION}
 ARG CARGO_PROFILE
 COPY gateway/ulid0.so /usr/lib/
 COPY gateway/ulid0_aarch64.so /usr/lib/
@@ -132,6 +132,8 @@ COPY --from=chef-planner /build/*.pem /usr/src/shuttle/
 
 #### LOGGER
 FROM docker.io/library/debian:bookworm-20230904-slim AS shuttle-logger
+ARG SHUTTLE_SERVICE_VERSION
+ENV SHUTTLE_SERVICE_VERSION=${SHUTTLE_SERVICE_VERSION}
 ARG CARGO_PROFILE
 COPY --from=chef-builder /build/target/${CARGO_PROFILE}/shuttle-logger /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/shuttle-logger"]
@@ -141,6 +143,8 @@ FROM shuttle-logger AS shuttle-logger-dev
 #### PROVISIONER
 ARG RUSTUP_TOOLCHAIN
 FROM bookworm-20230904-slim-plus AS shuttle-provisioner
+ARG SHUTTLE_SERVICE_VERSION
+ENV SHUTTLE_SERVICE_VERSION=${SHUTTLE_SERVICE_VERSION}
 ARG CARGO_PROFILE
 COPY --from=chef-builder /build/target/${CARGO_PROFILE}/shuttle-provisioner /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/shuttle-provisioner"]
@@ -149,6 +153,8 @@ FROM shuttle-provisioner AS shuttle-provisioner-dev
 
 #### RESOURCE RECORDER
 FROM docker.io/library/debian:bookworm-20230904-slim AS shuttle-resource-recorder
+ARG SHUTTLE_SERVICE_VERSION
+ENV SHUTTLE_SERVICE_VERSION=${SHUTTLE_SERVICE_VERSION}
 ARG CARGO_PROFILE
 COPY --from=chef-builder /build/target/${CARGO_PROFILE}/shuttle-resource-recorder /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/shuttle-resource-recorder"]

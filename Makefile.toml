@@ -1,0 +1,185 @@
+# 1. cargo install cargo-make
+# 2. cargo make <task_name>
+# cargo make docs: https://sagiegurari.github.io/cargo-make/
+# duckscript docs: https://github.com/sagiegurari/duckscript/blob/master/docs/sdk.md
+
+[config]
+default_to_workspace = false
+
+[env]
+RUST_BACKTRACE = 0
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+# TAG = { script = ["git describe --tags --abbrev=0"] }
+
+[tasks.fmt]
+command = "cargo"
+args = ["fmt", "--all", "--check"]
+
+[tasks.clippy]
+command = "cargo"
+args = [
+    "clippy",
+    "--tests",
+    "--all-targets",
+    "--all-features",
+    "--no-deps",
+    "--",
+    "--D",
+    "warnings",
+]
+
+# Provide the name of the workspace member
+# Example: cargo make test-member shuttle-proto
+[tasks.test-member]
+# run unit tests for a workspace crate
+command = "cargo"
+args = [
+    "test",
+    "-p",
+    "${@}",
+    "--all-features",
+    "--lib",
+    "--",
+    "--nocapture",
+]
+[tasks.test-member-integration]
+# run integration tests for a workspace crate
+command = "cargo"
+args = [
+    "test",
+    "-p",
+    "${@}",
+    "--all-features",
+    "--test",
+    "*",
+    "--",
+    "--skip",
+    "needs_docker",
+    "--nocapture",
+]
+[tasks.test-member-integration-docker]
+# run integration tests for a workspace crate that need access to docker
+command = "cargo"
+args = [
+    "test",
+    "-p",
+    "${@}",
+    "--all-features",
+    "--test",
+    "*",
+    "--",
+    "needs_docker",
+    "--nocapture",
+]
+
+[tasks.audit]
+install_crate = { crate_name = "cargo-audit", binary = "cargo", test_arg = ["audit", "-V"], min_version = "0.18.3" }
+command = "cargo"
+args = ["audit", "-D", "warnings"]
+
+[tasks.check-lockfile-patches]
+script = '''
+if [ -n "$(grep "\[\[patch.unused\]\]" Cargo.lock)" ]; then
+    echo "Please remove unused patches from Cargo.lock"
+    exit 1
+fi
+'''
+
+[tasks.check-lockfile]
+script = '''
+if ! git diff --exit-code Cargo.lock; then
+    echo "Please commit an up to date Cargo.lock"
+    exit 1
+fi
+'''
+
+[tasks.proto]
+# To generate: cargo make proto
+# To validate: cargo make proto validate
+# Requires `protoc` to be installed
+install_crate = { crate_name = "proto-gen", binary = "proto-gen", test_arg = "-V", version = "0.2.0" }
+script = '''
+OP="generate"
+if [ "$1" = "validate" ]; then
+    OP="validate"
+fi
+proto-gen \
+    --generate-transport --build-client --build-server --format \
+    $OP \
+    -d proto \
+    -o proto/src/generated \
+    -f proto/logger.proto \
+    -f proto/provisioner.proto \
+    -f proto/resource-recorder.proto \
+    -f proto/runtime.proto
+'''
+
+[tasks.changelog]
+# Provide the version to generate for
+# Example: cargo make changelog 0.37.0
+install_crate = { crate_name = "git-cliff", binary = "git-cliff", test_arg = ["-V"], min_version = "1.4.0" }
+command = "git-cliff"
+args = ["-o", "CHANGELOG.md", "-t", "${@}"]
+
+### CI TASKS
+
+[tasks.ci-workspace]
+run_task = { name = [
+    "check-lockfile-patches",
+    "fmt",
+    "clippy",
+    "check-lockfile",
+] }
+
+[tasks.ci-standalone]
+# Provide paths to crates to test
+# Example: cargo make ci-standalone services/shuttle-axum
+script_runner = "@duckscript"
+script = '''
+alias run exec --fail-on-error
+
+for path in ${@}
+
+
+if not ${path}
+    echo No crate path provided
+    exit 1
+end
+manifest = set "${path}/Cargo.toml"
+if not is_path_exists ${manifest}
+    echo manifest not found: ${manifest}
+    exit 1
+end
+
+feature_flags = array "--all-features"
+###### Crates that have mutually exclusive features define
+###### their own set of feature flags to test:
+if eq ${path} "resources/shared-db"
+    feature_flags = array "-F mongodb" "-F postgres" "-F postgres,sqlx" "-F postgres,sqlx-native-tls"
+elseif eq ${path} "services/shuttle-axum"
+    feature_flags = array "-F axum" "-F axum-0-6"
+elseif eq ${path} "services/shuttle-serenity"
+    feature_flags = array "-F serenity,rustls_backend" "-F serenity,native_tls_backend" "-F serenity-0-11-rustls_backend" "-F serenity-0-11-native_tls_backend"
+end
+
+echo
+println -s bold "### Manifest:"
+println -s bold "    ${manifest}"
+echo
+
+run cargo fmt --all --check --manifest-path ${manifest}
+
+for f in ${feature_flags}
+    echo
+    println -s bold "### Feature flags:"
+    println -s bold "    ${f}"
+    echo
+    # In the default case, --all-features overrides --no-default-features.
+    # --no-default-features is used for enabling special sets of feature flags.
+    run cargo clippy --tests --all-targets --no-default-features ${f} --manifest-path ${manifest} --no-deps -- --D warnings
+    run cargo test --no-default-features ${f} --manifest-path ${manifest} -- --nocapture
+end
+
+
+end
+'''

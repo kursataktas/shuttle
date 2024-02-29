@@ -1,7 +1,7 @@
 use std::io;
 
 use clap::Parser;
-use shuttle_common::{backends::tracing::setup_tracing, claims::AccountTier, log::Backend};
+use shuttle_common::{backends::trace::setup_tracing, claims::AccountTier, log::Backend};
 use sqlx::migrate::Migrator;
 use tracing::trace;
 
@@ -15,7 +15,7 @@ async fn main() -> io::Result<()> {
 
     trace!(args = ?args, "parsed args");
 
-    setup_tracing(tracing_subscriber::registry(), Backend::Auth, None);
+    setup_tracing(tracing_subscriber::registry(), Backend::Auth);
 
     let pool = pgpool_init(args.db_connection_uri.as_str())
         .await

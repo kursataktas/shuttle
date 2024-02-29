@@ -1,7 +1,6 @@
 use std::io;
 use std::io::Cursor;
 use std::net::Ipv4Addr;
-use std::ops::Sub;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -24,6 +23,7 @@ use opentelemetry::global;
 use opentelemetry_http::HeaderInjector;
 use shuttle_common::backends::headers::{XShuttleAccountName, XShuttleAdminSecret};
 use shuttle_common::claims::AccountTier;
+use shuttle_common::constants::SHUTTLE_IDLE_DOCS_URL;
 use shuttle_common::models::project::{ProjectName, State};
 use sqlx::error::DatabaseError;
 use sqlx::migrate::Migrator;
@@ -37,16 +37,12 @@ use tonic::transport::Endpoint;
 use tracing::{debug, error, info, instrument, trace, warn, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
-use x509_parser::nom::AsBytes;
-use x509_parser::parse_x509_certificate;
-use x509_parser::prelude::parse_x509_pem;
-use x509_parser::time::ASN1Time;
 
-use crate::acme::{AccountWrapper, AcmeClient, CustomDomain};
+use crate::acme::{AcmeClient, CustomDomain};
 use crate::args::ContextArgs;
 use crate::project::{Project, ProjectCreating, ProjectError, IS_HEALTHY_TIMEOUT};
 use crate::task::{self, BoxedTask, TaskBuilder};
-use crate::tls::{ChainAndPrivateKey, GatewayCertResolver, RENEWAL_VALIDITY_THRESHOLD_IN_DAYS};
+use crate::tls::ChainAndPrivateKey;
 use crate::worker::TaskRouter;
 use crate::{
     AccountName, DockerContext, DockerStatsSource, Error, ErrorKind, ProjectDetails, AUTH_CLIENT,
@@ -68,7 +64,6 @@ pub struct ContainerSettingsBuilder {
     prefix: Option<String>,
     image: Option<String>,
     provisioner: Option<String>,
-    builder: Option<String>,
     auth_uri: Option<String>,
     resource_recorder_uri: Option<String>,
     network_name: Option<String>,
@@ -88,7 +83,6 @@ impl ContainerSettingsBuilder {
             prefix: None,
             image: None,
             provisioner: None,
-            builder: None,
             auth_uri: None,
             resource_recorder_uri: None,
             network_name: None,
@@ -102,7 +96,6 @@ impl ContainerSettingsBuilder {
             prefix,
             network_name,
             provisioner_host,
-            builder_host,
             auth_uri,
             resource_recorder_uri,
             image,
@@ -113,7 +106,6 @@ impl ContainerSettingsBuilder {
         self.prefix(prefix)
             .image(image)
             .provisioner_host(provisioner_host)
-            .builder_host(builder_host)
             .auth_uri(auth_uri)
             .resource_recorder_uri(resource_recorder_uri)
             .network_name(network_name)
@@ -135,11 +127,6 @@ impl ContainerSettingsBuilder {
 
     pub fn provisioner_host<S: ToString>(mut self, host: S) -> Self {
         self.provisioner = Some(host.to_string());
-        self
-    }
-
-    pub fn builder_host<S: ToString>(mut self, host: S) -> Self {
-        self.builder = Some(host.to_string());
         self
     }
 
@@ -172,7 +159,6 @@ impl ContainerSettingsBuilder {
         let prefix = self.prefix.take().unwrap();
         let image = self.image.take().unwrap();
         let provisioner_host = self.provisioner.take().unwrap();
-        let builder_host = self.builder.take().unwrap();
         let auth_uri = self.auth_uri.take().unwrap();
         let resource_recorder_uri = self.resource_recorder_uri.take().unwrap();
         let extra_hosts = self.extra_hosts.take().unwrap();
@@ -184,7 +170,6 @@ impl ContainerSettingsBuilder {
             prefix,
             image,
             provisioner_host,
-            builder_host,
             auth_uri,
             resource_recorder_uri,
             network_name,
@@ -199,7 +184,6 @@ pub struct ContainerSettings {
     pub prefix: String,
     pub image: String,
     pub provisioner_host: String,
-    pub builder_host: String,
     pub auth_uri: String,
     pub resource_recorder_uri: String,
     pub network_name: String,
@@ -213,51 +197,11 @@ impl ContainerSettings {
     }
 }
 
-pub struct GatewayContextProvider {
-    docker: Docker,
-    settings: ContainerSettings,
-    gateway_api_key: String,
-    deploys_api_key: String,
-    auth_key_uri: Uri,
-    docker_stats_source: DockerStatsSource,
-}
-
-impl GatewayContextProvider {
-    pub fn new(
-        docker: Docker,
-        settings: ContainerSettings,
-        gateway_api_key: String,
-        deploys_api_key: String,
-        auth_key_uri: Uri,
-        docker_stats_source: DockerStatsSource,
-    ) -> Self {
-        Self {
-            docker,
-            settings,
-            gateway_api_key,
-            deploys_api_key,
-            auth_key_uri,
-            docker_stats_source,
-        }
-    }
-
-    pub fn context(&self) -> GatewayContext {
-        GatewayContext {
-            docker: self.docker.clone(),
-            settings: self.settings.clone(),
-            gateway_api_key: self.gateway_api_key.clone(),
-            deploys_api_key: self.deploys_api_key.clone(),
-            auth_key_uri: self.auth_key_uri.clone(),
-            docker_stats_source: self.docker_stats_source.clone(),
-        }
-    }
-}
-
 pub struct GatewayService {
-    provider: GatewayContextProvider,
+    context: GatewayContext,
     db: SqlitePool,
     task_router: TaskRouter,
-    state_location: PathBuf,
+    pub state_location: PathBuf,
 
     /// Maximum number of containers the gateway can start before blocking cch projects
     cch_container_limit: u32,
@@ -313,18 +257,18 @@ impl GatewayService {
 
         let container_settings = ContainerSettings::builder().from_args(&args).await;
 
-        let provider = GatewayContextProvider::new(
+        let provider = GatewayContext {
             docker,
-            container_settings,
-            args.admin_key,
-            args.deploys_api_key,
-            format!("{}auth/key", args.auth_uri).parse().unwrap(),
+            settings: container_settings,
+            gateway_api_key: args.admin_key,
+            deploys_api_key: args.deploys_api_key,
+            auth_key_uri: format!("{}auth/key", args.auth_uri).parse().unwrap(),
             docker_stats_source,
-        );
+        };
 
         let task_router = TaskRouter::default();
         Ok(Self {
-            provider,
+            context: provider,
             db,
             task_router,
             state_location,
@@ -416,6 +360,17 @@ impl GatewayService {
         Ok(ready_count)
     }
 
+    /// The number of cch projects that are currently in the ready state
+    pub async fn count_ready_cch_projects(&self) -> Result<u32, Error> {
+        let ready_count: u32 =
+            query("SELECT COUNT(*) FROM projects, JSON_EACH(project_state) WHERE key = 'ready' AND project_name LIKE 'cch23-%'")
+                .fetch_one(&self.db)
+                .await?
+                .get::<_, usize>(0);
+
+        Ok(ready_count)
+    }
+
     pub async fn find_project(
         &self,
         project_name: &ProjectName,
@@ -429,8 +384,11 @@ impl GatewayService {
                 state: r
                     .try_get::<SqlxJson<Project>, _>("project_state")
                     .map(|p| p.0)
-                    .unwrap_or_else(|e| {
-                        error!(error = ?e, "Failed to deser `project_state`");
+                    .unwrap_or_else(|err| {
+                        error!(
+                            error = &err as &dyn std::error::Error,
+                            "Failed to deser `project_state`"
+                        );
                         Project::Errored(ProjectError::internal(
                             "Error when trying to deserialize state of project.",
                         ))
@@ -480,8 +438,11 @@ impl GatewayService {
                     // This can be invalid JSON if it refers to an outdated Project state
                     row.try_get::<SqlxJson<Project>, _>("project_state")
                         .map(|p| p.0)
-                        .unwrap_or_else(|e| {
-                            error!(error = ?e, "Failed to deser `project_state`");
+                        .unwrap_or_else(|err| {
+                            error!(
+                                error = &err as &dyn std::error::Error,
+                                "Failed to deser `project_state`"
+                            );
                             Project::Errored(ProjectError::internal(
                                 "Error when trying to deserialize state of project.",
                             ))
@@ -575,8 +536,11 @@ impl GatewayService {
             let project = row
                 .try_get::<SqlxJson<Project>, _>("project_state")
                 .map(|p| p.0)
-                .unwrap_or_else(|e| {
-                    error!(error = ?e, "Failed to deser `project_state`");
+                .unwrap_or_else(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        "Failed to deser `project_state`"
+                    );
                     Project::Errored(ProjectError::internal(
                         "Error when trying to deserialize state of project.",
                     ))
@@ -584,7 +548,7 @@ impl GatewayService {
             let project_id = row.get::<String, _>("project_id");
             if project.is_destroyed() {
                 // But is in `::Destroyed` state, recreate it
-                let mut creating = ProjectCreating::new_with_random_initial_key(
+                let creating = ProjectCreating::new_with_random_initial_key(
                     project_name.clone(),
                     Ulid::from_string(project_id.as_str()).map_err(|err| {
                         Error::custom(
@@ -594,16 +558,6 @@ impl GatewayService {
                     })?,
                     idle_minutes,
                 );
-                // Restore previous custom domain, if any
-                match self.find_custom_domain_for_project(&project_id).await {
-                    Ok(custom_domain) => {
-                        creating = creating.with_fqdn(custom_domain.fqdn.to_string());
-                    }
-                    Err(error) if error.kind() == ErrorKind::CustomDomainNotFound => {
-                        // no previous custom domain
-                    }
-                    Err(error) => return Err(error),
-                }
                 let project = Project::Creating(creating);
                 self.update_project(&project_name, &project).await?;
                 Ok(FindProjectPayload {
@@ -634,8 +588,7 @@ impl GatewayService {
                         format!("project '{project_name}' is already {state}. Try using `cargo shuttle project restart` instead.")
                     }
                     State::Stopped => {
-                        format!("project '{project_name}' is idled. Find out more about idle projects here: \
-				 https://docs.shuttle.rs/getting-started/idle-projects")
+                        format!("project '{project_name}' is idled. Find out more about idle projects here: {SHUTTLE_IDLE_DOCS_URL}")
                     }
                     State::Errored { message } => {
                         format!("project '{project_name}' is in an errored state.\nproject message: {message}")
@@ -776,14 +729,14 @@ impl GatewayService {
             .map_err(|_| Error::from_kind(ErrorKind::Internal))
     }
 
-    async fn find_custom_domain_for_project(
+    pub async fn find_custom_domain_for_project(
         &self,
-        project_id: &str,
-    ) -> Result<CustomDomain, Error> {
+        project_name: &str,
+    ) -> Result<Option<CustomDomain>, Error> {
         let custom_domain = query(
-            "SELECT fqdn, project_name, certificate, private_key FROM custom_domains AS cd JOIN projects AS p ON cd.project_id = p.project_id WHERE p.project_id = ?1",
+            "SELECT fqdn, project_name, certificate, private_key FROM custom_domains AS cd JOIN projects AS p ON cd.project_id = p.project_id WHERE p.project_name = ?1",
         )
-        .bind(project_id)
+        .bind(project_name)
         .fetch_optional(&self.db)
         .await?
         .map(|row| CustomDomain {
@@ -791,8 +744,8 @@ impl GatewayService {
             project_name: row.try_get("project_name").unwrap(),
             certificate: row.get("certificate"),
             private_key: row.get("private_key"),
-        })
-        .ok_or_else(|| Error::from(ErrorKind::CustomDomainNotFound))?;
+        });
+
         Ok(custom_domain)
     }
 
@@ -858,7 +811,7 @@ impl GatewayService {
         }
     }
 
-    async fn create_certificate<'a>(
+    pub async fn create_certificate<'a>(
         &self,
         acme: &AcmeClient,
         creds: AccountCredentials<'a>,
@@ -904,54 +857,16 @@ impl GatewayService {
         }
     }
 
-    /// Renew the gateway certificate if there less than 30 days until the current
-    /// certificate expiration.
-    pub(crate) async fn renew_certificate(
-        &self,
-        acme: &AcmeClient,
-        resolver: Arc<GatewayCertResolver>,
-        creds: AccountCredentials<'_>,
-    ) {
-        let account = AccountWrapper::from(creds).0;
-        let certs = self.fetch_certificate(acme, account.credentials()).await;
-        // Safe to unwrap because a 'ChainAndPrivateKey' is built from a PEM.
-        let chain_and_pk = certs.into_pem().unwrap();
-
-        let (_, pem) = parse_x509_pem(chain_and_pk.as_bytes())
-            .unwrap_or_else(|_| panic!("Malformed existing PEM certificate for the gateway."));
-        let (_, x509_cert) = parse_x509_certificate(pem.contents.as_bytes())
-            .unwrap_or_else(|_| panic!("Malformed existing X509 certificate for the gateway."));
-
-        // We compute the difference between the certificate expiry date and current timestamp because we want to trigger the
-        // gateway certificate renewal only during it's last 30 days of validity or if the certificate is expired.
-        let diff = x509_cert.validity().not_after.sub(ASN1Time::now());
-
-        // Renew only when the difference is `None` (meaning certificate expired) or we're within the last 30 days of validity.
-        if diff.is_none()
-            || diff
-                .expect("to be Some given we checked for None previously")
-                .whole_days()
-                <= RENEWAL_VALIDITY_THRESHOLD_IN_DAYS
-        {
-            let tls_path = self.state_location.join("ssl.pem");
-            let certs = self.create_certificate(acme, account.credentials()).await;
-            resolver
-                .serve_default_der(certs.clone())
-                .await
-                .expect("Failed to serve the default certs");
-            certs
-                .save_pem(&tls_path)
-                .expect("to save the certificate locally");
-        }
-    }
-
-    pub fn context(&self) -> GatewayContext {
-        self.provider.context()
+    pub fn context(&self) -> &GatewayContext {
+        &self.context
     }
 
     /// Create a builder for a new [ProjectTask]
     pub fn new_task(self: &Arc<Self>) -> TaskBuilder {
-        TaskBuilder::new(self.clone())
+        TaskBuilder::new(
+            self.clone(),
+            Span::current().metadata().map(|m| m.name().to_string()),
+        )
     }
 
     /// Find a project by name. And start the project if it is idle, waiting for it to start up
@@ -1029,15 +944,20 @@ impl GatewayService {
         is_cch_project: bool,
         account_tier: &AccountTier,
     ) -> Result<(), Error> {
-        let current_container_count = self.count_ready_projects().await?;
+        // If this control file exists, block routing to cch23 projects.
+        // Used for emergency load mitigation
+        const CCH_CONTROL_FILE: &str = "/var/lib/shuttle/BLOCK_CCH23_PROJECT_TRAFFIC";
+        const CCH_CONCURRENT_LIMIT: u32 = 20;
 
-        let has_capacity = if is_cch_project
-            && std::fs::metadata("/var/lib/shuttle/BLOCK_CCH23_PROJECT_TRAFFIC").is_ok()
+        if is_cch_project
+            && (std::fs::metadata(CCH_CONTROL_FILE).is_ok()
+                || self.count_ready_cch_projects().await? >= CCH_CONCURRENT_LIMIT)
         {
-            // If this control file exists, block routing to cch23 projects.
-            // Used for emergency load mitigation
             return Err(Error::from_kind(ErrorKind::CapacityLimit));
-        } else if current_container_count < self.cch_container_limit {
+        }
+
+        let current_container_count = self.count_ready_projects().await?;
+        let has_capacity = if current_container_count < self.cch_container_limit {
             true
         } else if current_container_count < self.soft_container_limit {
             !is_cch_project
@@ -1079,16 +999,26 @@ impl DockerContext for GatewayContext {
     async fn get_stats(&self, container_id: &str) -> Result<u64, Error> {
         match self.docker_stats_source {
             DockerStatsSource::CgroupV1 => {
-                let cpu_usage: u64 =
-                tokio::fs::read_to_string(format!("{DOCKER_STATS_PATH_CGROUP_V1}/{container_id}/cpuacct.usage"))
-                .await.map_err(|e| {
-                    error!(error = %e, shuttle.container.id = container_id, "failed to read docker stats file for container");
+                let cpu_usage: u64 = tokio::fs::read_to_string(format!(
+                    "{DOCKER_STATS_PATH_CGROUP_V1}/{container_id}/cpuacct.usage"
+                ))
+                .await
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to read docker stats file for container"
+                    );
                     ProjectError::internal("failed to read docker stats file for container")
                 })?
                 .trim()
                 .parse()
-                .map_err(|e| {
-                    error!(error = %e, shuttle.container.id = container_id, "failed to parse cpu usage stat");
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to parse cpu usage stat"
+                    );
 
                     ProjectError::internal("failed to parse cpu usage to u64")
                 })?;
@@ -1099,28 +1029,49 @@ impl DockerContext for GatewayContext {
                 let cpu_usage: u64 = tokio::fs::read_to_string(format!(
                     "{DOCKER_STATS_PATH_CGROUP_V2}/docker-{container_id}.scope/cpu.stat"
                 ))
-                    .await
-                    .map_err(|e| {
-                        error!(error = %e, shuttle.container.id = container_id, "failed to read docker stats file for container");
-                        ProjectError::internal("failed to read docker stats file for container")
-                    })?
-                    .lines()
-                    .next()
-                    .ok_or_else(|| {
-                        error!(shuttle.container.id = container_id, "failed to read first line of docker stats file for container");
-                        ProjectError::internal("failed to read first line of docker stats file for container")
-                    })?
-                    .split(' ')
-                    .nth(1)
-                    .ok_or_else(|| {
-                        error!(shuttle.container.id = container_id, "failed to split docker stats line for container");
-                        ProjectError::internal("failed to split docker stats line for container")
-                    })?
-                    .parse::<u64>()
-                    .map_err(|e| {
-                        error!(error = %e, shuttle.container.id = container_id, "failed to parse cpu usage stat");
-                        ProjectError::internal("failed to parse cpu usage to u64")
-                    })?;
+                .await
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to read docker stats file for container"
+                    );
+                    ProjectError::internal("failed to read docker stats file for container")
+                })?
+                .lines()
+                .next()
+                .ok_or_else(|| {
+                    let err = ProjectError::internal(
+                        "failed to read first line of docker stats file for container",
+                    );
+                    error!(
+                        shuttle.container.id = container_id,
+                        error = &err as &dyn std::error::Error,
+                    );
+
+                    err
+                })?
+                .split(' ')
+                .nth(1)
+                .ok_or_else(|| {
+                    let err =
+                        ProjectError::internal("failed to split docker stats line for container");
+                    error!(
+                        shuttle.container.id = container_id,
+                        error = &err as &dyn std::error::Error,
+                    );
+
+                    err
+                })?
+                .parse::<u64>()
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to parse cpu usage stat"
+                    );
+                    ProjectError::internal("failed to parse cpu usage to u64")
+                })?;
                 Ok(cpu_usage * 1_000)
             }
             DockerStatsSource::Bollard => {
@@ -1554,10 +1505,7 @@ pub mod tests {
             .await
             .unwrap();
 
-        let Project::Creating(creating) = recreated_project.state else {
-            panic!("Project should be Creating");
-        };
-        assert_eq!(creating.fqdn(), &Some(domain.to_string()));
+        assert!(matches!(recreated_project.state, Project::Creating(_)));
 
         Ok(())
     }

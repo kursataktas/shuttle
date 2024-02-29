@@ -1,6 +1,6 @@
 [package]
 name = "shuttle-gateway"
-version = "0.36.0"
+version = "0.39.0"
 edition.workspace = true
 license.workspace = true
 publish = false
@@ -9,10 +9,9 @@ publish = false
 shuttle-common = { workspace = true, features = [
     "backend",
     "models",
-    "openapi",
     "persist",
 ] }
-shuttle-proto = { workspace = true, features = ["provisioner"] }
+shuttle-proto = { workspace = true, features = ["provisioner-client"] }
 shuttle-orchestrator = { workspace = true }
 
 async-trait = { workspace = true }
@@ -51,8 +50,6 @@ tracing = { workspace = true, features = ["default"] }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["default", "env-filter"] }
 ttl_cache = { workspace = true }
-utoipa = { workspace = true }
-utoipa-swagger-ui = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 x509-parser = "0.15.1"
 tonic = { workspace = true }
@@ -70,7 +67,8 @@ portpicker = { workspace = true }
 ring = { workspace = true }
 rmp-serde = { workspace = true }
 shuttle-common-tests = { workspace = true }
+shuttle-proto = { workspace = true, features = ["test-utils"] }
 snailquote = "0.3.1"
 tar = { workspace = true }
 tempfile = { workspace = true }
-test-context = "0.1.4"
+test-context = { workspace = true }

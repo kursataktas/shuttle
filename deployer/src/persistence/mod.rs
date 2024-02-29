@@ -1,19 +1,15 @@
-use std::net::SocketAddr;
 use std::path::Path;
 use std::str::FromStr;
 
 use chrono::Utc;
 use error::{Error, Result};
 use hyper::Uri;
-use shuttle_common::{
-    claims::{Claim, ClaimLayer, InjectPropagationLayer},
-    resource::Type,
-};
+use shuttle_common::{claims::Claim, resource::Type};
 use shuttle_proto::{
-    provisioner::{provisioner_client::ProvisionerClient, DatabaseRequest},
+    provisioner::{self, DatabaseRequest},
     resource_recorder::{
-        record_request, resource_recorder_client::ResourceRecorderClient, RecordRequest,
-        ResourceIds, ResourceResponse, ResourcesResponse, ResultResponse, ServiceResourcesRequest,
+        self, record_request, ProjectResourcesRequest, RecordRequest, ResourceIds,
+        ResourceResponse, ResourcesResponse, ResultResponse,
     },
 };
 use sqlx::{
@@ -22,9 +18,8 @@ use sqlx::{
     QueryBuilder,
 };
 use tokio::task::JoinHandle;
-use tonic::{transport::Endpoint, Request};
-use tower::ServiceBuilder;
-use tracing::{error, info, instrument, trace};
+use tonic::Request;
+use tracing::{error, info, trace};
 use ulid::Ulid;
 use uuid::Uuid;
 
@@ -46,7 +41,6 @@ use self::{
     resource::{Resource, ResourceManager},
 };
 use crate::deployment::ActiveDeploymentsGetter;
-use crate::proxy::AddressGetter;
 
 pub static MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
@@ -54,20 +48,8 @@ pub static MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 pub struct Persistence {
     pool: SqlitePool,
     state_send: tokio::sync::mpsc::UnboundedSender<DeploymentState>,
-    resource_recorder_client: Option<
-        ResourceRecorderClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    >,
-    provisioner_client: Option<
-        ProvisionerClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    resource_recorder_client: Option<resource_recorder::Client>,
+    provisioner_client: Option<provisioner::Client>,
     project_id: Ulid,
 }
 
@@ -78,8 +60,8 @@ impl Persistence {
     /// than repeatedly calling [`Persistence::new`].
     pub async fn new(
         path: &str,
-        resource_recorder_uri: &Uri,
-        provisioner_address: &Uri,
+        resource_recorder_uri: Uri,
+        provisioner_uri: Uri,
         project_id: Ulid,
     ) -> (Self, JoinHandle<()>) {
         if !Path::new(path).exists() {
@@ -109,13 +91,7 @@ impl Persistence {
 
         let pool = SqlitePool::connect_with(sqlite_options).await.unwrap();
 
-        Self::configure(
-            pool,
-            resource_recorder_uri.to_string(),
-            provisioner_address.to_string(),
-            project_id,
-        )
-        .await
+        Self::configure(pool, resource_recorder_uri, provisioner_uri, project_id).await
     }
 
     #[cfg(test)]
@@ -144,34 +120,12 @@ impl Persistence {
 
     async fn configure(
         pool: SqlitePool,
-        resource_recorder_uri: String,
-        provisioner_address: String,
+        resource_recorder_uri: Uri,
+        provisioner_uri: Uri,
         project_id: Ulid,
     ) -> (Self, JoinHandle<()>) {
-        let channel = Endpoint::from_shared(resource_recorder_uri)
-            .expect("to have a valid string endpoint for the resource recorder")
-            .connect()
-            .await
-            .expect("failed to connect to resource recorder");
-
-        let resource_recorder_service = ServiceBuilder::new()
-            .layer(ClaimLayer)
-            .layer(InjectPropagationLayer)
-            .service(channel);
-
-        let channel = Endpoint::from_shared(provisioner_address)
-            .expect("to have a valid string endpoint for the provisioner")
-            .connect()
-            .await
-            .expect("failed to connect to provisioner");
-
-        let provisioner_service = ServiceBuilder::new()
-            .layer(ClaimLayer)
-            .layer(InjectPropagationLayer)
-            .service(channel);
-
-        let resource_recorder_client = ResourceRecorderClient::new(resource_recorder_service);
-        let provisioner_client = ProvisionerClient::new(provisioner_service);
+        let resource_recorder_client = resource_recorder::get_client(resource_recorder_uri).await;
+        let provisioner_client = provisioner::get_client(provisioner_uri).await;
 
         let (state_send, handle) = Self::from_pool(pool.clone()).await;
 
@@ -227,7 +181,7 @@ impl Persistence {
             .bind(deployment.service_id.to_string())
             .bind(deployment.state)
             .bind(deployment.last_update)
-            .bind(deployment.address.map(|socket| socket.to_string()))
+            .bind(Option::<String>::None)
             .bind(deployment.is_next)
             .bind(deployment.git_commit_id.as_ref())
             .bind(deployment.git_commit_msg.as_ref())
@@ -268,7 +222,7 @@ impl Persistence {
     }
 
     pub async fn get_active_deployment(&self, service_id: &Ulid) -> Result<Option<Deployment>> {
-        sqlx::query_as("SELECT * FROM deployments WHERE service_id = ? AND state = ?")
+        sqlx::query_as("SELECT * FROM deployments WHERE service_id = ? AND state = ? ORDER BY last_update DESC")
             .bind(service_id.to_string())
             .bind(State::Running)
             .fetch_optional(&self.pool)
@@ -347,24 +301,6 @@ impl Persistence {
         .map_err(Error::from)
     }
 
-    /// Gets a deployment if it is runnable
-    pub async fn get_runnable_deployment(&self, id: &Uuid) -> Result<Option<DeploymentRunnable>> {
-        sqlx::query_as(
-            r#"SELECT d.id, service_id, s.name AS service_name, d.is_next
-                FROM deployments AS d
-                JOIN services AS s ON s.id = d.service_id
-                WHERE state IN (?, ?, ?)
-                AND d.id = ?"#,
-        )
-        .bind(State::Running)
-        .bind(State::Stopped)
-        .bind(State::Completed)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(Error::from)
-    }
-
     pub async fn stop_running_deployment(&self, deployable: DeploymentRunnable) -> Result<()> {
         update_deployment(
             &self.pool,
@@ -406,19 +342,18 @@ impl ResourceManager for Persistence {
         service_id: &Ulid,
         claim: Claim,
     ) -> Result<ResultResponse> {
-        let mut record_req: tonic::Request<RecordRequest> = tonic::Request::new(RecordRequest {
+        let mut req: tonic::Request<RecordRequest> = tonic::Request::new(RecordRequest {
             project_id: self.project_id.to_string(),
             service_id: service_id.to_string(),
             resources,
         });
-
-        record_req.extensions_mut().insert(claim);
+        req.extensions_mut().insert(claim);
 
         info!("Uploading resources to resource-recorder");
         self.resource_recorder_client
             .as_mut()
             .expect("to have the resource recorder set up")
-            .record_resources(record_req)
+            .record_resources(req)
             .await
             .map_err(PersistenceError::ResourceRecorder)
             .map(|res| res.into_inner())
@@ -429,18 +364,18 @@ impl ResourceManager for Persistence {
         service_id: &Ulid,
         claim: Claim,
     ) -> Result<ResourcesResponse> {
-        let mut service_resources_req = tonic::Request::new(ServiceResourcesRequest {
-            service_id: service_id.to_string(),
+        let mut req = tonic::Request::new(ProjectResourcesRequest {
+            project_id: self.project_id.to_string(),
         });
 
-        service_resources_req.extensions_mut().insert(claim.clone());
+        req.extensions_mut().insert(claim.clone());
 
-        info!(%service_id, "Getting resources from resource-recorder");
+        info!(%self.project_id, "Getting resources from resource-recorder");
         let res = self
             .resource_recorder_client
             .as_mut()
             .expect("to have the resource recorder set up")
-            .get_service_resources(service_resources_req)
+            .get_project_resources(req)
             .await
             .map_err(PersistenceError::ResourceRecorder)
             .map(|res| res.into_inner())?;
@@ -450,8 +385,7 @@ impl ResourceManager for Persistence {
             info!("Got no resources from resource-recorder");
             // Check if there are cached resources on the local persistence.
             let resources: std::result::Result<Vec<Resource>, sqlx::Error> =
-                sqlx::query_as("SELECT * FROM resources WHERE service_id = ?")
-                    .bind(service_id.to_string())
+                sqlx::query_as("SELECT * FROM resources")
                     .fetch_all(&self.pool)
                     .await;
 
@@ -476,18 +410,18 @@ impl ResourceManager for Persistence {
                 self.insert_resources(local_resources, service_id, claim.clone())
                     .await?;
 
-                let mut service_resources_req = tonic::Request::new(ServiceResourcesRequest {
-                    service_id: service_id.to_string(),
+                let mut req = tonic::Request::new(ProjectResourcesRequest {
+                    project_id: self.project_id.to_string(),
                 });
 
-                service_resources_req.extensions_mut().insert(claim);
+                req.extensions_mut().insert(claim);
 
                 info!("Getting resources from resource-recorder again");
                 let res = self
                     .resource_recorder_client
                     .as_mut()
                     .expect("to have the resource recorder set up")
-                    .get_service_resources(service_resources_req)
+                    .get_project_resources(req)
                     .await
                     .map_err(PersistenceError::ResourceRecorder)
                     .map(|res| res.into_inner())?;
@@ -500,8 +434,7 @@ impl ResourceManager for Persistence {
                 info!("Deleting local resources");
                 // Now that we know that the resources are in resource-recorder,
                 // we can safely delete them from here to prevent de-sync issues and to not hinder project deletion
-                sqlx::query("DELETE FROM resources WHERE service_id = ?")
-                    .bind(service_id.to_string())
+                sqlx::query("DELETE FROM resources")
                     .execute(&self.pool)
                     .await?;
 
@@ -518,19 +451,18 @@ impl ResourceManager for Persistence {
         r#type: shuttle_common::resource::Type,
         claim: Claim,
     ) -> Result<ResourceResponse> {
-        let mut get_resource_req = tonic::Request::new(ResourceIds {
+        let mut req = tonic::Request::new(ResourceIds {
             project_id: self.project_id.to_string(),
             service_id: service_id.to_string(),
             r#type: r#type.to_string(),
         });
-
-        get_resource_req.extensions_mut().insert(claim);
+        req.extensions_mut().insert(claim);
 
         return self
             .resource_recorder_client
             .as_mut()
             .expect("to have the resource recorder set up")
-            .get_resource(get_resource_req)
+            .get_resource(req)
             .await
             .map_err(PersistenceError::ResourceRecorder)
             .map(|res| res.into_inner());
@@ -544,34 +476,32 @@ impl ResourceManager for Persistence {
         claim: Claim,
     ) -> Result<ResultResponse> {
         if let Type::Database(db_type) = resource_type {
-            let proto_db_type: shuttle_proto::provisioner::database_request::DbType =
-                db_type.into();
             if let Some(inner) = &mut self.provisioner_client {
-                let mut db_request = Request::new(DatabaseRequest {
+                let mut req = Request::new(DatabaseRequest {
                     project_name,
-                    db_type: Some(proto_db_type),
+                    db_type: Some(db_type.into()),
                 });
-                db_request.extensions_mut().insert(claim.clone());
+                req.extensions_mut().insert(claim.clone());
+
                 inner
-                    .delete_database(db_request)
+                    .delete_database(req)
                     .await
                     .map_err(error::Error::Provisioner)?;
             };
         }
 
-        let mut delete_resource_req = tonic::Request::new(ResourceIds {
+        let mut req = tonic::Request::new(ResourceIds {
             project_id: self.project_id.to_string(),
             service_id: service_id.to_string(),
             r#type: resource_type.to_string(),
         });
-
-        delete_resource_req.extensions_mut().insert(claim);
+        req.extensions_mut().insert(claim);
 
         return self
             .resource_recorder_client
             .as_mut()
             .expect("to have the resource recorder set up")
-            .delete_resource(delete_resource_req)
+            .delete_resource(req)
             .await
             .map(|res| res.into_inner())
             .map_err(PersistenceError::ResourceRecorder);
@@ -579,54 +509,8 @@ impl ResourceManager for Persistence {
 }
 
 #[async_trait::async_trait]
-impl AddressGetter for Persistence {
-    #[instrument(skip_all, fields(shuttle.service.name = service_name))]
-    async fn get_address_for_service(
-        &self,
-        service_name: &str,
-    ) -> crate::handlers::Result<Option<std::net::SocketAddr>> {
-        let address_str = sqlx::query_as::<_, (String,)>(
-            r#"SELECT d.address
-                FROM deployments AS d
-                JOIN services AS s ON d.service_id = s.id
-                WHERE s.name = ? AND d.state = ?
-                ORDER BY d.last_update
-                DESC"#,
-        )
-        .bind(service_name)
-        .bind(State::Running)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(Error::from)
-        .map_err(crate::handlers::Error::Persistence)?;
-
-        if let Some((address_str,)) = address_str {
-            SocketAddr::from_str(&address_str).map(Some).map_err(|err| {
-                crate::handlers::Error::Convert {
-                    from: "String".to_string(),
-                    to: "SocketAddr".to_string(),
-                    message: err.to_string(),
-                }
-            })
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-#[async_trait::async_trait]
 impl DeploymentUpdater for Persistence {
     type Err = Error;
-
-    async fn set_address(&self, id: &Uuid, address: &SocketAddr) -> Result<()> {
-        sqlx::query("UPDATE deployments SET address = ? WHERE id = ?")
-            .bind(address.to_string())
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(Error::from)
-    }
 
     async fn set_is_next(&self, id: &Uuid, is_next: bool) -> Result<()> {
         sqlx::query("UPDATE deployments SET is_next = ? WHERE id = ?")
@@ -675,8 +559,6 @@ impl StateRecorder for Persistence {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
-
     use chrono::{Duration, TimeZone, Utc};
     use rand::Rng;
 
@@ -699,7 +581,6 @@ mod tests {
             last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 43, 33).unwrap(),
             ..Default::default()
         };
-        let address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12345);
 
         p.insert_deployment(&deployment).await.unwrap();
         assert_eq!(p.get_deployment(&id).await.unwrap().unwrap(), deployment);
@@ -714,12 +595,11 @@ mod tests {
         .await
         .unwrap();
 
-        p.set_address(&id, &address).await.unwrap();
         p.set_is_next(&id, true).await.unwrap();
 
         let update = p.get_deployment(&id).await.unwrap().unwrap();
         assert_eq!(update.state, State::Built);
-        assert_eq!(update.address, Some(address));
+        assert_eq!(update.address, None);
         assert!(update.is_next);
         assert_ne!(
             update.last_update,
@@ -738,12 +618,7 @@ mod tests {
                 service_id,
                 state: State::Running,
                 last_update: Utc::now(),
-                address: None,
-                is_next: false,
-                git_commit_id: None,
-                git_commit_msg: None,
-                git_branch: None,
-                git_dirty: None,
+                ..Default::default()
             })
             .collect();
 
@@ -776,7 +651,6 @@ mod tests {
             service_id: xyz_id,
             state: State::Crashed,
             last_update: Utc.with_ymd_and_hms(2022, 4, 25, 7, 29, 35).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -785,7 +659,6 @@ mod tests {
             service_id: xyz_id,
             state: State::Stopped,
             last_update: Utc.with_ymd_and_hms(2022, 4, 25, 7, 49, 35).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -794,7 +667,6 @@ mod tests {
             service_id,
             state: State::Running,
             last_update: Utc.with_ymd_and_hms(2022, 4, 25, 7, 39, 39).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -803,7 +675,6 @@ mod tests {
             service_id: xyz_id,
             state: State::Running,
             last_update: Utc.with_ymd_and_hms(2022, 4, 25, 7, 48, 29).unwrap(),
-            address: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9876)),
             is_next: true,
             ..Default::default()
         };
@@ -835,7 +706,6 @@ mod tests {
             service_id: other_id,
             state: State::Running,
             last_update: Utc.with_ymd_and_hms(2023, 4, 17, 1, 1, 2).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -844,7 +714,6 @@ mod tests {
             service_id,
             state: State::Crashed,
             last_update: Utc.with_ymd_and_hms(2023, 4, 17, 1, 1, 2).unwrap(), // second
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -853,7 +722,6 @@ mod tests {
             service_id,
             state: State::Stopped,
             last_update: Utc.with_ymd_and_hms(2023, 4, 17, 1, 1, 1).unwrap(), // first
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -862,7 +730,6 @@ mod tests {
             service_id,
             state: State::Running,
             last_update: Utc.with_ymd_and_hms(2023, 4, 17, 1, 1, 3).unwrap(), // third
-            address: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9876)),
             is_next: true,
             ..Default::default()
         };
@@ -899,7 +766,6 @@ mod tests {
             service_id,
             state: State::Crashed,
             last_update: time,
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -908,7 +774,6 @@ mod tests {
             service_id,
             state: State::Stopped,
             last_update: time.checked_add_signed(Duration::seconds(1)).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -917,7 +782,6 @@ mod tests {
             service_id,
             state: State::Running,
             last_update: time.checked_add_signed(Duration::seconds(2)).unwrap(),
-            address: Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9876)),
             is_next: false,
             ..Default::default()
         };
@@ -926,7 +790,6 @@ mod tests {
             service_id,
             state: State::Queued,
             last_update: time.checked_add_signed(Duration::seconds(3)).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -935,7 +798,6 @@ mod tests {
             service_id,
             state: State::Building,
             last_update: time.checked_add_signed(Duration::seconds(4)).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -944,7 +806,6 @@ mod tests {
             service_id,
             state: State::Built,
             last_update: time.checked_add_signed(Duration::seconds(5)).unwrap(),
-            address: None,
             is_next: true,
             ..Default::default()
         };
@@ -953,7 +814,6 @@ mod tests {
             service_id,
             state: State::Loading,
             last_update: time.checked_add_signed(Duration::seconds(6)).unwrap(),
-            address: None,
             is_next: false,
             ..Default::default()
         };
@@ -1014,7 +874,6 @@ mod tests {
                 service_id,
                 state: State::Built,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 29, 33).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
@@ -1023,7 +882,6 @@ mod tests {
                 service_id: foo_id,
                 state: State::Running,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 29, 44).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
@@ -1032,7 +890,6 @@ mod tests {
                 service_id: bar_id,
                 state: State::Running,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 33, 48).unwrap(),
-                address: None,
                 is_next: true,
                 ..Default::default()
             },
@@ -1041,7 +898,6 @@ mod tests {
                 service_id: service_id2,
                 state: State::Crashed,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 38, 52).unwrap(),
-                address: None,
                 is_next: true,
                 ..Default::default()
             },
@@ -1050,27 +906,12 @@ mod tests {
                 service_id: foo_id,
                 state: State::Running,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 42, 32).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
         ] {
             p.insert_deployment(deployment).await.unwrap();
         }
-
-        let runnable = p.get_runnable_deployment(&id_1).await.unwrap();
-        assert_eq!(
-            runnable,
-            Some(DeploymentRunnable {
-                id: id_1,
-                service_name: "foo".to_string(),
-                service_id: foo_id,
-                is_next: false,
-            })
-        );
-
-        let runnable = p.get_runnable_deployment(&id_crashed).await.unwrap();
-        assert_eq!(runnable, None);
 
         let runnable = p.get_all_runnable_deployments().await.unwrap();
         assert_eq!(
@@ -1123,46 +964,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn address_getter() {
-        let (p, _) = Persistence::new_in_memory().await;
-        let service_id = add_service_named(&p.pool, "service-name").await.unwrap();
-        let service_other_id = add_service_named(&p.pool, "other-name").await.unwrap();
-
-        sqlx::query(
-            "INSERT INTO deployments (id, service_id, state, last_update, address) VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
-        )
-        // This running item should match
-        .bind(Uuid::new_v4())
-        .bind(service_id.to_string())
-        .bind(State::Running)
-        .bind(Utc::now())
-        .bind("10.0.0.5:12356")
-        // A stopped item should not match
-        .bind(Uuid::new_v4())
-        .bind(service_id.to_string())
-        .bind(State::Stopped)
-        .bind(Utc::now())
-        .bind("10.0.0.5:9876")
-        // Another service should not match
-        .bind(Uuid::new_v4())
-        .bind(service_other_id.to_string())
-        .bind(State::Running)
-        .bind(Utc::now())
-        .bind("10.0.0.5:5678")
-        .execute(&p.pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            SocketAddr::from(([10, 0, 0, 5], 12356)),
-            p.get_address_for_service("service-name")
-                .await
-                .unwrap()
-                .unwrap(),
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn active_deployment_getter() {
         let (p, _) = Persistence::new_in_memory().await;
         let service_id = add_service_named(&p.pool, "service-name").await.unwrap();
@@ -1175,7 +976,6 @@ mod tests {
                 service_id,
                 state: State::Built,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 29, 33).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
@@ -1184,7 +984,6 @@ mod tests {
                 service_id,
                 state: State::Stopped,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 29, 44).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
@@ -1193,7 +992,6 @@ mod tests {
                 service_id,
                 state: State::Running,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 33, 48).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
@@ -1202,7 +1000,6 @@ mod tests {
                 service_id,
                 state: State::Crashed,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 38, 52).unwrap(),
-                address: None,
                 is_next: false,
                 ..Default::default()
             },
@@ -1211,7 +1008,6 @@ mod tests {
                 service_id,
                 state: State::Running,
                 last_update: Utc.with_ymd_and_hms(2022, 4, 25, 4, 42, 32).unwrap(),
-                address: None,
                 is_next: true,
                 ..Default::default()
             },

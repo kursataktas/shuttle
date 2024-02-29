@@ -1,17 +1,11 @@
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
-use fqdn::FQDN;
-use hyper::{
-    server::conn::AddrStream,
-    service::{make_service_fn, service_fn},
-};
 pub use persistence::Persistence;
-use proxy::AddressGetter;
 pub use runtime_manager::RuntimeManager;
 use shuttle_common::log::LogRecorder;
-use shuttle_proto::{builder::builder_client::BuilderClient, logger::logger_client::LoggerClient};
+use shuttle_proto::{logger, provisioner};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::info;
 use ulid::Ulid;
 
 mod args;
@@ -19,12 +13,12 @@ pub mod deployment;
 pub mod error;
 pub mod handlers;
 pub mod persistence;
-mod proxy;
 mod runtime_manager;
 
 pub use crate::args::Args;
 pub use crate::deployment::state_change_layer::StateChangeLayer;
-use crate::deployment::{gateway_client::GatewayClient, DeploymentManager};
+use crate::deployment::{Built, DeploymentManager};
+use shuttle_common::backends::client::gateway;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -32,20 +26,12 @@ pub async fn start(
     persistence: Persistence,
     runtime_manager: Arc<Mutex<RuntimeManager>>,
     log_recorder: impl LogRecorder,
-    log_fetcher: LoggerClient<
-        shuttle_common::claims::ClaimService<
-            shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-        >,
-    >,
-    builder_client: Option<
-        BuilderClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    log_fetcher: logger::Client,
     args: Args,
 ) {
+    let project_id = Ulid::from_string(args.project_id.as_str())
+        .expect("to have a valid ULID as project_id arg");
+
     // when _set is dropped once axum exits, the deployment tasks will be aborted.
     let deployment_manager = DeploymentManager::builder()
         .build_log_recorder(log_recorder)
@@ -54,30 +40,46 @@ pub async fn start(
         .runtime(runtime_manager)
         .deployment_updater(persistence.clone())
         .resource_manager(persistence.clone())
-        .builder_client(builder_client)
-        .queue_client(GatewayClient::new(args.gateway_uri))
+        .provisioner_client(provisioner::get_client(args.provisioner_address).await)
+        .queue_client(gateway::Client::new(
+            args.gateway_uri.clone(),
+            args.gateway_uri,
+        ))
         .log_fetcher(log_fetcher)
         .build();
 
     persistence.cleanup_invalid_states().await.unwrap();
 
-    let runnable_deployments = persistence.get_all_runnable_deployments().await.unwrap();
-    info!(count = %runnable_deployments.len(), "stopping all but last running deploy");
-
-    // Make sure we don't stop the last running deploy. This works because they are returned in descending order.
-    let project_id = Ulid::from_string(args.project_id.as_str())
-        .expect("to have a valid ULID as project_id arg");
-    for existing_deployment in runnable_deployments.into_iter().skip(1) {
+    let deployments = persistence.get_all_runnable_deployments().await.unwrap();
+    info!(count = %deployments.len(), "Deployments considered in the running state");
+    // This works because they are returned in descending order.
+    let mut deployments = deployments.into_iter();
+    let last_running_deployment = deployments.next();
+    info!("Marking all but last running deployment as stopped");
+    for older_deployment in deployments {
         persistence
-            .stop_running_deployment(existing_deployment)
+            .stop_running_deployment(older_deployment)
             .await
             .unwrap();
+    }
+    if let Some(deployment) = last_running_deployment {
+        info!("Starting up last running deployment");
+        let built = Built {
+            id: deployment.id,
+            service_name: deployment.service_name,
+            service_id: deployment.service_id,
+            project_id,
+            tracing_context: Default::default(),
+            is_next: deployment.is_next,
+            claim: None,
+            secrets: Default::default(),
+        };
+        deployment_manager.run_push(built).await;
     }
 
     let mut builder = handlers::RouterBuilder::new(
         persistence,
         deployment_manager,
-        args.proxy_fqdn,
         args.project,
         project_id,
         args.auth_uri,
@@ -98,31 +100,4 @@ pub async fn start(
         .serve(router.into_make_service())
         .await
         .unwrap_or_else(|_| panic!("Failed to bind to address: {}", args.api_address));
-}
-
-pub async fn start_proxy(
-    proxy_address: SocketAddr,
-    fqdn: FQDN,
-    address_getter: impl AddressGetter,
-) {
-    let make_service = make_service_fn(move |socket: &AddrStream| {
-        let remote_address = socket.remote_addr();
-        let address_getter = address_getter.clone();
-        let fqdn = fqdn.clone();
-
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                proxy::handle(remote_address, fqdn.clone(), req, address_getter.clone())
-            }))
-        }
-    });
-
-    let server = hyper::Server::bind(&proxy_address).serve(make_service);
-
-    info!("Starting proxy server on: {}", proxy_address);
-
-    if let Err(e) = server.await {
-        error!(error = %e, "proxy died, killing process...");
-        std::process::exit(1);
-    }
 }

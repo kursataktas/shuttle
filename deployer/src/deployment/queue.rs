@@ -14,8 +14,6 @@ use shuttle_common::{
     log::LogRecorder,
     LogItem,
 };
-use shuttle_proto::builder::builder_client::BuilderClient;
-use shuttle_proto::builder::BuildRequest;
 use shuttle_service::builder::{build_workspace, BuiltService};
 use tar::Archive;
 use tokio::{
@@ -24,7 +22,6 @@ use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
-use tonic::Request;
 use tracing::{debug, debug_span, error, info, instrument, trace, warn, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
@@ -35,20 +32,12 @@ use super::{Built, QueueReceiver, RunSender, State};
 use crate::error::{Error, Result, TestError};
 use crate::persistence::DeploymentUpdater;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn task(
     mut recv: QueueReceiver,
     run_send: RunSender,
     deployment_updater: impl DeploymentUpdater,
     log_recorder: impl LogRecorder,
     queue_client: impl BuildQueueClient,
-    builder_client: Option<
-        BuilderClient<
-            shuttle_common::claims::ClaimService<
-                shuttle_common::claims::InjectPropagation<tonic::transport::Channel>,
-            >,
-        >,
-    >,
     builds_path: PathBuf,
 ) {
     info!("Queue task started");
@@ -66,7 +55,6 @@ pub async fn task(
                 let log_recorder = log_recorder.clone();
                 let queue_client = queue_client.clone();
                 let builds_path = builds_path.clone();
-                let builder_client = builder_client.clone();
 
                 tasks.spawn(async move {
                     let parent_cx = global::get_text_map_propagator(|propagator| {
@@ -85,27 +73,6 @@ pub async fn task(
                         .await
                         {
                             return build_failed_to_get_slot(&id, err);
-                        }
-
-                        if let Some(mut inner) = builder_client {
-                            let deployment_id = queued.id.to_string();
-                            let archive = queued.data.clone();
-                            let claim = queued.claim.clone();
-                            tokio::spawn(async move {
-                                let mut req = Request::new(BuildRequest {
-                                    deployment_id,
-                                    archive,
-                                });
-                                req.extensions_mut().insert(claim);
-
-                                match inner.build(req).await {
-                                    Ok(inner) =>  {
-                                        let response = inner.into_inner();
-                                        info!(id = %queued.id, "shuttle-builder finished building the deployment: image length is {} bytes, is_wasm flag is {} and there are {} secrets", response.image.len(), response.is_wasm, response.secrets.len());
-                                    },
-                                    Err(err) => error!(id = %queued.id, "shuttle-builder errored while building: {}", err)
-                                };
-                            });
                         }
 
                         match queued
@@ -133,7 +100,7 @@ pub async fn task(
             Some(res) = tasks.join_next() => {
                 match res {
                     Ok(_) => (),
-                    Err(err) => error!(error = %err, "an error happened while joining a builder task"),
+                    Err(err) => error!(error = &err as &dyn std::error::Error, "an error happened while joining a builder task"),
                 }
             }
             else => break
@@ -278,7 +245,7 @@ impl Queued {
             project_id: self.project_id,
             tracing_context: Default::default(),
             is_next,
-            claim: self.claim,
+            claim: Some(self.claim),
             secrets,
         };
 
@@ -402,20 +369,24 @@ async fn run_pre_deploy_tests(
     tokio::spawn(async move {
         let mut lines = reader.lines();
         while let Some(line) = lines.next_line().await.unwrap() {
-            let _ = tx
-                .send(line)
-                .await
-                .map_err(|e| error!(error = %e, "failed to send line"));
+            let _ = tx.send(line).await.map_err(|err| {
+                error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to send line"
+                )
+            });
         }
     });
     let reader = tokio::io::BufReader::new(handle.stderr.take().unwrap());
     tokio::spawn(async move {
         let mut lines = reader.lines();
         while let Some(line) = lines.next_line().await.unwrap() {
-            let _ = tx2
-                .send(line)
-                .await
-                .map_err(|e| error!(error = %e, "failed to send line"));
+            let _ = tx2.send(line).await.map_err(|err| {
+                error!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to send line"
+                )
+            });
         }
     });
     let status = handle.wait().await.map_err(TestError::Run)?;

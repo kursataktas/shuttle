@@ -9,7 +9,7 @@ use axum::http::{request::Parts, Request, Response};
 use opentelemetry::global;
 use opentelemetry_http::HeaderExtractor;
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
-use tower_http::trace::DefaultOnRequest;
+use tower_http::trace::{DefaultOnBodyChunk, DefaultOnEos, DefaultOnRequest};
 use tracing::{debug, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -83,10 +83,14 @@ impl<MakeSpan: tower_http::trace::MakeSpan<Body> + MakeSpanBuilder> TraceLayer<M
         MakeSpan,
         DefaultOnRequest,
         OnResponseStatusCode,
+        DefaultOnBodyChunk,
+        DefaultOnEos,
+        (),
     > {
         tower_http::trace::TraceLayer::new_for_http()
             .make_span_with(MakeSpan::new(self.fn_span))
             .on_response(OnResponseStatusCode)
+            .on_failure(())
     }
 }
 
@@ -159,7 +163,9 @@ pub struct OnResponseStatusCode;
 
 impl tower_http::trace::OnResponse<BoxBody> for OnResponseStatusCode {
     fn on_response(self, response: &Response<BoxBody>, latency: Duration, span: &Span) {
-        span.record("http.status_code", response.status().as_u16());
+        // We use set_attribute here because span.record would overwrite the error.message field in
+        // Datadog.
+        span.set_attribute("http.status_code", response.status().as_u16() as i64);
         debug!(
             latency = format_args!("{} ns", latency.as_nanos()),
             "finished processing request"

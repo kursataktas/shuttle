@@ -4,16 +4,17 @@ use clap::Parser;
 use shuttle_common::{
     backends::{
         auth::{AuthPublicKey, JwtAuthenticationLayer},
-        tracing::{setup_tracing, ExtractPropagationLayer},
+        trace::setup_tracing,
     },
+    extract_propagation::ExtractPropagationLayer,
     log::Backend,
 };
-use shuttle_provisioner::{Args, MyProvisioner, ProvisionerServer};
+use shuttle_provisioner::{Args, ProvisionerServer, ShuttleProvisioner};
 use tonic::transport::Server;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setup_tracing(tracing_subscriber::registry(), Backend::Provisioner, None);
+    setup_tracing(tracing_subscriber::registry(), Backend::Provisioner);
 
     let Args {
         ip,
@@ -24,15 +25,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         internal_pg_address,
         internal_mongodb_address,
         auth_uri,
+        gateway_uri,
+        resource_recorder_uri,
     } = Args::parse();
     let addr = SocketAddr::new(ip, port);
 
-    let provisioner = MyProvisioner::new(
+    let provisioner = ShuttleProvisioner::new(
         &shared_pg_uri,
         &shared_mongodb_uri,
         fqdn.to_string(),
         internal_pg_address,
         internal_mongodb_address,
+        resource_recorder_uri,
+        gateway_uri,
     )
     .await
     .unwrap();

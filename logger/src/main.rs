@@ -4,8 +4,9 @@ use clap::Parser;
 use shuttle_common::{
     backends::{
         auth::{AuthPublicKey, JwtAuthenticationLayer},
-        tracing::{setup_tracing, ExtractPropagationLayer},
+        trace::setup_tracing,
     },
+    extract_propagation::ExtractPropagationLayer,
     log::Backend,
 };
 use shuttle_logger::{args::Args, Postgres, Service};
@@ -17,7 +18,7 @@ use tracing::trace;
 async fn main() {
     let args = Args::parse();
 
-    setup_tracing(tracing_subscriber::registry(), Backend::Logger, None);
+    setup_tracing(tracing_subscriber::registry(), Backend::Logger);
 
     trace!(args = ?args, "parsed args");
 

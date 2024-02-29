@@ -7,28 +7,50 @@ use axum::{
     http::request::Parts,
     TypedHeader,
 };
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
-use shuttle_common::{backends::headers::XShuttleAdminSecret, claims::AccountTier, ApiKey, Secret};
+use shuttle_common::{
+    backends::headers::XShuttleAdminSecret, claims::AccountTier, limits::Limits, models, ApiKey,
+    Secret,
+};
 use sqlx::{postgres::PgRow, query, FromRow, PgPool, Row};
 use tracing::{debug, error, trace, Span};
 
 use crate::{api::UserManagerState, error::Error};
-use stripe::{
-    CheckoutSession, CheckoutSessionStatus, Expandable, SubscriptionId, SubscriptionStatus,
-};
+use stripe::{SubscriptionId, SubscriptionStatus};
 
 #[async_trait]
 pub trait UserManagement: Send + Sync {
+    /// Create a user with the given tier
     async fn create_user(&self, name: AccountName, tier: AccountTier) -> Result<User, Error>;
-    async fn upgrade_to_pro(
+
+    /// Change the tier for a user
+    async fn update_tier(&self, name: &AccountName, tier: AccountTier) -> Result<(), Error>;
+
+    /// Get a user by their account name
+    async fn get_user(&self, name: AccountName) -> Result<User, Error>;
+
+    /// Get a user by their api key
+    async fn get_user_by_key(&self, key: ApiKey) -> Result<User, Error>;
+
+    /// Reset the key that belongs to an account
+    async fn reset_key(&self, name: AccountName) -> Result<(), Error>;
+
+    /// Insert a subscription for an account
+    async fn insert_subscription(
         &self,
         name: &AccountName,
-        checkout_session_metadata: CheckoutSession,
+        subscription_id: &str,
+        subscription_type: &models::user::SubscriptionType,
+        subscription_quantity: i32,
     ) -> Result<(), Error>;
-    async fn update_tier(&self, name: &AccountName, tier: AccountTier) -> Result<(), Error>;
-    async fn get_user(&self, name: AccountName) -> Result<User, Error>;
-    async fn get_user_by_key(&self, key: ApiKey) -> Result<User, Error>;
-    async fn reset_key(&self, name: AccountName) -> Result<(), Error>;
+
+    /// Delete a subscription from an account
+    async fn delete_subscription(
+        &self,
+        name: &AccountName,
+        subscription_id: &str,
+    ) -> Result<(), Error>;
 }
 
 #[derive(Clone)]
@@ -49,52 +71,7 @@ impl UserManagement for UserManager {
             .execute(&self.pool)
             .await?;
 
-        Ok(User::new(name, key, tier, None))
-    }
-
-    // Update user tier to pro and update the subscription id.
-    async fn upgrade_to_pro(
-        &self,
-        name: &AccountName,
-        checkout_session_metadata: CheckoutSession,
-    ) -> Result<(), Error> {
-        // Update the user tier and store the subscription id. We expect the checkout session to be
-        // completed when it is sent. In case of incomplete checkout sessions, auth backend will not
-        // fulfill the request.
-        if checkout_session_metadata
-            .status
-            .filter(|inner| inner == &CheckoutSessionStatus::Complete)
-            .is_some()
-        {
-            // Extract the checkout session status if any, otherwise return with error.
-            let subscription_id = checkout_session_metadata
-                .subscription
-                .map(|s| match s {
-                    Expandable::Id(id) => id.to_string(),
-                    Expandable::Object(obj) => obj.id.to_string(),
-                })
-                .ok_or(Error::MissingSubscriptionId)?;
-
-            // Update the user account tier and subscription_id.
-            let rows_affected = query(
-                "UPDATE users SET account_tier = $1, subscription_id = $2 WHERE account_name = $3",
-            )
-            .bind(AccountTier::Pro.to_string())
-            .bind(subscription_id)
-            .bind(name)
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-
-            // In case no rows were updated, this means the account doesn't exist.
-            if rows_affected > 0 {
-                Ok(())
-            } else {
-                Err(Error::UserNotFound)
-            }
-        } else {
-            Err(Error::IncompleteCheckoutSession)
-        }
+        Ok(User::new(name, key, tier, vec![]))
     }
 
     // Update tier leaving the subscription_id untouched.
@@ -114,16 +91,31 @@ impl UserManagement for UserManager {
     }
 
     async fn get_user(&self, name: AccountName) -> Result<User, Error> {
-        let mut user: User =
-            sqlx::query_as("SELECT account_name, key, account_tier, subscription_id FROM users WHERE account_name = $1")
-                .bind(&name)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or(Error::UserNotFound)?;
+        let mut user: User = sqlx::query_as(
+            "SELECT account_name, key, account_tier FROM users WHERE account_name = $1",
+        )
+        .bind(&name)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(Error::UserNotFound)?;
+
+        let subscriptions: Vec<Subscription> = sqlx::query_as(
+            "SELECT subscription_id, type, quantity, created_at, updated_at FROM subscriptions WHERE account_name = $1",
+        )
+        .bind(&user.name.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        if !subscriptions.is_empty() {
+            user.subscriptions = subscriptions;
+        }
 
         // Sync the user tier based on the subscription validity, if any.
         if let Err(err) = user.sync_tier(self).await {
-            error!("failed syncing account");
+            error!(
+                error = &err as &dyn std::error::Error,
+                "failed syncing account"
+            );
             return Err(err);
         } else {
             debug!("synced account");
@@ -133,13 +125,23 @@ impl UserManagement for UserManager {
     }
 
     async fn get_user_by_key(&self, key: ApiKey) -> Result<User, Error> {
-        let mut user: User = sqlx::query_as(
-            "SELECT account_name, key, account_tier, subscription_id FROM users WHERE key = $1",
+        let mut user: User =
+            sqlx::query_as("SELECT account_name, key, account_tier FROM users WHERE key = $1")
+                .bind(&key)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(Error::UserNotFound)?;
+
+        let subscriptions: Vec<Subscription> = sqlx::query_as(
+            "SELECT subscription_id, type, quantity, created_at, updated_at FROM subscriptions WHERE account_name = $1",
         )
-        .bind(&key)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(Error::UserNotFound)?;
+        .bind(&user.name.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+
+        if !subscriptions.is_empty() {
+            user.subscriptions = subscriptions;
+        }
 
         // Sync the user tier based on the subscription validity, if any.
         if user.sync_tier(self).await? {
@@ -165,14 +167,97 @@ impl UserManagement for UserManager {
             Err(Error::UserNotFound)
         }
     }
+
+    async fn insert_subscription(
+        &self,
+        name: &AccountName,
+        subscription_id: &str,
+        subscription_type: &models::user::SubscriptionType,
+        subscription_quantity: i32,
+    ) -> Result<(), Error> {
+        let mut transaction = self.pool.begin().await?;
+
+        if *subscription_type == models::user::SubscriptionType::Pro {
+            query("UPDATE users SET account_tier = $1 WHERE account_name = $2")
+                .bind(AccountTier::Pro.to_string())
+                .bind(name)
+                .execute(&mut *transaction)
+                .await?;
+        }
+
+        // Insert a new subscription. If the same type of subscription already exists, update the
+        // subscription id and quantity.
+        let rows_affected = query(
+            r#"INSERT INTO subscriptions (subscription_id, account_name, type, quantity)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (account_name, type)
+            DO UPDATE SET subscription_id = EXCLUDED.subscription_id, quantity = EXCLUDED.quantity
+        "#,
+        )
+        .bind(subscription_id)
+        .bind(name)
+        .bind(subscription_type.to_string())
+        .bind(subscription_quantity)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+
+        transaction.commit().await?;
+
+        // In case no rows were updated, this means the account doesn't exist.
+        if rows_affected > 0 {
+            Ok(())
+        } else {
+            Err(Error::UserNotFound)
+        }
+    }
+
+    async fn delete_subscription(
+        &self,
+        name: &AccountName,
+        subscription_id: &str,
+    ) -> Result<(), Error> {
+        let subscription: Subscription = sqlx::query_as(
+            "SELECT subscription_id, type, quantity, created_at, updated_at FROM subscriptions WHERE account_name = $1 AND subscription_id = $2",
+        )
+        .bind(name)
+        .bind(subscription_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        if subscription.r#type == models::user::SubscriptionType::Pro {
+            self.update_tier(name, AccountTier::CancelledPro).await?;
+        } else {
+            query(
+                r#"DELETE FROM subscriptions
+                WHERE subscription_id = $1 AND account_name = $2
+            "#,
+            )
+            .bind(subscription_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        }
+
+        Ok(())
+    }
 }
 
-#[derive(Clone, Deserialize, PartialEq, Eq, Serialize, Debug)]
+#[derive(Clone, Debug)]
 pub struct User {
     pub name: AccountName,
     pub key: Secret<ApiKey>,
     pub account_tier: AccountTier,
-    pub subscription_id: Option<SubscriptionId>,
+    pub subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Subscription {
+    pub id: stripe::SubscriptionId,
+    pub r#type: models::user::SubscriptionType,
+    pub quantity: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl User {
@@ -180,23 +265,30 @@ impl User {
         self.account_tier == AccountTier::Admin
     }
 
+    fn pro_subscription_id(&self) -> Option<&stripe::SubscriptionId> {
+        self.subscriptions
+            .iter()
+            .find(|sub| matches!(sub.r#type, models::user::SubscriptionType::Pro))
+            .map(|sub| &sub.id)
+    }
+
     pub fn new(
         name: AccountName,
         key: ApiKey,
         account_tier: AccountTier,
-        subscription_id: Option<SubscriptionId>,
+        subscriptions: Vec<Subscription>,
     ) -> Self {
         Self {
             name,
             key: Secret::new(key),
             account_tier,
-            subscription_id,
+            subscriptions,
         }
     }
 
     /// In case of an existing subscription, check if valid.
     async fn subscription_is_valid(&self, client: &stripe::Client) -> Result<bool, Error> {
-        if let Some(subscription_id) = self.subscription_id.as_ref() {
+        if let Some(subscription_id) = self.pro_subscription_id() {
             let subscription = stripe::Subscription::retrieve(client, subscription_id, &[]).await?;
             debug!("subscription: {:#?}", subscription);
             return Ok(subscription.status == SubscriptionStatus::Active
@@ -259,11 +351,45 @@ impl FromRow<'_, PgRow> for User {
                     source: Box::new(std::io::Error::new(ErrorKind::Other, err.to_string())),
                 },
             )?,
-            subscription_id: row
+            subscriptions: vec![],
+        })
+    }
+}
+
+impl FromRow<'_, PgRow> for Subscription {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Subscription {
+            id: row
                 .try_get("subscription_id")
                 .ok()
-                .and_then(|inner| SubscriptionId::from_str(inner).ok()),
+                .and_then(|inner| SubscriptionId::from_str(inner).ok())
+                .unwrap(),
+            r#type: models::user::SubscriptionType::from_str(row.try_get("type").unwrap())
+                .map_err(|err| sqlx::Error::ColumnDecode {
+                    index: "type".to_string(),
+                    source: Box::new(std::io::Error::new(ErrorKind::Other, err.to_string())),
+                })?,
+            quantity: row.try_get("quantity").unwrap(),
+            created_at: row.try_get("created_at").unwrap(),
+            updated_at: row.try_get("updated_at").unwrap(),
         })
+    }
+}
+
+impl From<User> for Limits {
+    fn from(user: User) -> Self {
+        let mut limits: Limits = user.account_tier.into();
+
+        let rds_quota = user
+            .subscriptions
+            .iter()
+            .find(|sub| matches!(sub.r#type, models::user::SubscriptionType::Rds))
+            .map(|sub| sub.quantity as u32)
+            .unwrap_or(0);
+
+        limits.set_rds_quota(rds_quota);
+
+        limits
     }
 }
 
@@ -293,13 +419,25 @@ where
     }
 }
 
-impl From<User> for shuttle_common::models::user::Response {
+impl From<User> for models::user::Response {
     fn from(user: User) -> Self {
         Self {
             name: user.name.to_string(),
             key: user.key.expose().as_ref().to_owned(),
             account_tier: user.account_tier.to_string(),
-            subscription_id: user.subscription_id.map(|inner| inner.to_string()),
+            subscriptions: user.subscriptions.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<Subscription> for models::user::Subscription {
+    fn from(subscription: Subscription) -> Self {
+        Self {
+            id: subscription.id.to_string(),
+            r#type: subscription.r#type,
+            quantity: subscription.quantity,
+            created_at: subscription.created_at,
+            updated_at: subscription.updated_at,
         }
     }
 }

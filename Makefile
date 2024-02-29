@@ -17,13 +17,12 @@ endif
 
 BUILDX_FLAGS=$(BUILDX_OP) $(PLATFORM_FLAGS) $(CACHE_FLAGS)
 
-# the rust version used by our containers, and as an override for our deployers
-# ensuring all user crates are compiled with the same rustc toolchain
-RUSTUP_TOOLCHAIN=1.75.0
+# The Rust version used by our containers
+# Can be updated to the latest stable
+RUSTUP_TOOLCHAIN=1.76.0
 
 TAG?=$(shell git describe --tags --abbrev=0)
 AUTH_TAG?=$(TAG)
-BUILDER_TAG?=$(TAG)
 DEPLOYER_TAG?=$(TAG)
 GATEWAY_TAG?=$(TAG)
 LOGGER_TAG?=$(TAG)
@@ -58,7 +57,7 @@ CONTAINER_REGISTRY=public.ecr.aws/shuttle
 # make sure we only ever go to production with `--tls=enable`
 USE_TLS=enable
 CARGO_PROFILE=release
-RUST_LOG?=nbuild_core=warn,shuttle=debug,info
+RUST_LOG?=shuttle=debug,info
 else
 DOCKER_COMPOSE_FILES=docker-compose.yml docker-compose.dev.yml
 STACK?=shuttle-dev
@@ -68,7 +67,7 @@ CONTAINER_REGISTRY=public.ecr.aws/shuttle-dev
 USE_TLS?=disable
 # default for local run
 CARGO_PROFILE?=debug
-RUST_LOG?=nbuild_core=warn,shuttle=debug,info
+RUST_LOG?=shuttle=debug,info
 DEV_SUFFIX=-dev
 DEPLOYS_API_KEY?=gateway4deployes
 GATEWAY_ADMIN_KEY?=dh9z58jttoes3qvt
@@ -92,17 +91,8 @@ endif
 POSTGRES_EXTRA_PATH?=./extras/postgres
 POSTGRES_TAG?=14
 
-PANAMAX_EXTRA_PATH?=./extras/panamax
-PANAMAX_TAG?=1.0.12
-
 OTEL_EXTRA_PATH?=./extras/otel
 OTEL_TAG?=0.90.1
-
-USE_PANAMAX?=enable
-ifeq ($(USE_PANAMAX), enable)
-PREPARE_ARGS+=-p
-COMPOSE_PROFILES+=panamax
-endif
 
 ifeq ($(SHUTTLE_DETACH), disable)
 SHUTTLE_DETACH=
@@ -113,7 +103,6 @@ endif
 DOCKER_COMPOSE_ENV=\
 	STACK=$(STACK)\
 	AUTH_TAG=$(AUTH_TAG)\
-	BUILDER_TAG=$(BUILDER_TAG)\
 	DEPLOYER_TAG=$(DEPLOYER_TAG)\
 	GATEWAY_TAG=$(GATEWAY_TAG)\
 	LOGGER_TAG=$(LOGGER_TAG)\
@@ -126,7 +115,6 @@ DOCKER_COMPOSE_ENV=\
 	LOGGER_POSTGRES_TAG=${LOGGER_POSTGRES_TAG}\
 	LOGGER_POSTGRES_PASSWORD=${LOGGER_POSTGRES_PASSWORD}\
 	LOGGER_POSTGRES_URI=${LOGGER_POSTGRES_URI}\
-	PANAMAX_TAG=${PANAMAX_TAG}\
 	OTEL_TAG=${OTEL_TAG}\
 	APPS_FQDN=$(APPS_FQDN)\
 	DB_FQDN=$(DB_FQDN)\
@@ -143,20 +131,21 @@ DOCKER_COMPOSE_ENV=\
 	USE_TLS=$(USE_TLS)\
 	COMPOSE_PROFILES=$(COMPOSE_PROFILES)\
 	DOCKER_SOCK=$(DOCKER_SOCK)\
-	SHUTTLE_ENV=$(SHUTTLE_ENV)
+	SHUTTLE_ENV=$(SHUTTLE_ENV)\
+	SHUTTLE_SERVICE_VERSION=$(SHUTTLE_SERVICE_VERSION)
 
-.PHONY: clean cargo-clean images the-shuttle-images shuttle-% postgres panamax otel deploy test docker-compose.rendered.yml up down
+.PHONY: clean deep-clean images the-shuttle-images shuttle-% postgres otel deploy test docker-compose.rendered.yml up down
 
 clean:
 	rm .shuttle-*
 	rm docker-compose.rendered.yml
 
-cargo-clean:
-	find . -type d \( -name target -or -name .shuttle-executables \) | xargs rm -rf
+deep-clean:
+	find . -type d \( -name target -or -name .shuttle-executables -or -name node_modules \) | xargs rm -rf
 
-images: the-shuttle-images postgres panamax otel
+images: the-shuttle-images postgres otel
 
-the-shuttle-images: shuttle-auth shuttle-builder shuttle-deployer shuttle-gateway shuttle-logger shuttle-provisioner shuttle-resource-recorder
+the-shuttle-images: shuttle-auth shuttle-deployer shuttle-gateway shuttle-logger shuttle-provisioner shuttle-resource-recorder
 
 shuttle-%:
 	$(DOCKER_BUILD) \
@@ -165,6 +154,7 @@ shuttle-%:
 		--build-arg crate=$(@) \
 		--build-arg prepare_args=$(PREPARE_ARGS) \
 		--build-arg SHUTTLE_ENV=$(SHUTTLE_ENV) \
+		--build-arg SHUTTLE_SERVICE_VERSION=$(SHUTTLE_SERVICE_VERSION) \
 		--build-arg RUSTUP_TOOLCHAIN=$(RUSTUP_TOOLCHAIN) \
 		--build-arg CARGO_PROFILE=$(CARGO_PROFILE) \
 		--tag $(CONTAINER_REGISTRY)/$(*):$(COMMIT_SHA) \
@@ -181,16 +171,6 @@ postgres:
 		$(BUILDX_FLAGS) \
 		-f $(POSTGRES_EXTRA_PATH)/Containerfile \
 		$(POSTGRES_EXTRA_PATH)
-
-panamax:
-	if [ $(USE_PANAMAX) = "enable" ]; then \
-		$(DOCKER_BUILD) \
-			--build-arg PANAMAX_TAG=$(PANAMAX_TAG) \
-			--tag $(CONTAINER_REGISTRY)/panamax:$(PANAMAX_TAG) \
-			$(BUILDX_FLAGS) \
-			-f $(PANAMAX_EXTRA_PATH)/Containerfile \
-			$(PANAMAX_EXTRA_PATH); \
-	fi
 
 otel:
 	$(DOCKER_BUILD) \
@@ -211,9 +191,7 @@ test:
 docker-compose.rendered.yml: docker-compose.yml docker-compose.dev.yml
 	$(DOCKER_COMPOSE_ENV) $(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.dev.yml $(DOCKER_COMPOSE_CONFIG_FLAGS) -p $(STACK) config > $@
 
-# Start the containers locally. This does not start panamax by default,
-# to start panamax locally run this command with an override for the profiles:
-# `make COMPOSE_PROFILES=panamax up`
+# Start the containers locally.
 up: $(DOCKER_COMPOSE_FILES)
 	$(DOCKER_COMPOSE_ENV) \
 	$(DOCKER_COMPOSE) \
@@ -228,7 +206,3 @@ down: $(DOCKER_COMPOSE_FILES)
 	$(addprefix -f ,$(DOCKER_COMPOSE_FILES)) \
 	-p $(STACK) \
 	down
-
-# make tag=v0.0.0 changelog
-changelog:
-	git cliff -o CHANGELOG.md -t $(tag)

@@ -1,9 +1,10 @@
 use std::{fmt, path::Path, str::FromStr, time::SystemTime};
 
-use crate::{r#type::Type, Error};
+use crate::Error;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use prost_types::Timestamp;
+use shuttle_common::resource::Type;
 use shuttle_proto::resource_recorder::{self, record_request};
 use sqlx::{
     migrate::{MigrateDatabase, Migrator},
@@ -29,7 +30,10 @@ impl fmt::Display for DalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
             DalError::Sqlx(error) => {
-                error!(error = error.to_string(), "database request failed");
+                error!(
+                    error = error as &dyn std::error::Error,
+                    "database request failed"
+                );
 
                 "failed to interact with recorder"
             }
@@ -54,9 +58,6 @@ pub trait Dal {
 
     /// Get the resources that belong to a project
     async fn get_project_resources(&self, project_id: Ulid) -> Result<Vec<Resource>, DalError>;
-
-    /// Get the resources that belong to a service
-    async fn get_service_resources(&self, service_id: Ulid) -> Result<Vec<Resource>, DalError>;
 
     /// Get a resource
     async fn get_resource(
@@ -177,15 +178,6 @@ impl Dal for Sqlite {
         Ok(result)
     }
 
-    async fn get_service_resources(&self, service_id: Ulid) -> Result<Vec<Resource>, DalError> {
-        let result = sqlx::query_as(r#"SELECT * FROM resources WHERE service_id = ?"#)
-            .bind(service_id.to_string())
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(result)
-    }
-
     async fn get_resource(
         &self,
         resource: resource_recorder::ResourceIds,
@@ -255,7 +247,8 @@ impl TryFrom<record_request::Resource> for Resource {
     type Error = String;
 
     fn try_from(value: record_request::Resource) -> Result<Self, Self::Error> {
-        Ok(Self::new(value.r#type.parse()?, value.data, value.config))
+        let r#type = value.r#type.parse()?;
+        Ok(Self::new(r#type, value.data, value.config))
     }
 }
 

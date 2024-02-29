@@ -134,14 +134,11 @@ pub async fn build_workspace(
             let mut shuttle_deps = member
                 .dependencies
                 .iter()
-                .filter_map(|d| {
-                    d.name
-                        .starts_with("shuttle-")
-                        .then(|| format!("{} '{}'", d.name, d.req))
-                })
+                .filter(|&d| d.name.starts_with("shuttle-"))
+                .map(|d| format!("{} '{}'", d.name, d.req))
                 .collect::<Vec<_>>();
             shuttle_deps.sort();
-            info!(name = member.name, deps = ?shuttle_deps, "Compiled workspace member with shuttle dependencies");
+            info!(name = member.name, deps = ?shuttle_deps, "Compiling workspace member with shuttle dependencies");
         }
         if next {
             ensure_cdylib(member)?;
@@ -294,7 +291,10 @@ async fn compile(
     tokio::spawn(async move {
         let mut lines = reader.lines();
         while let Some(line) = lines.next_line().await.unwrap() {
-            let _ = tx.send(line).await.map_err(|e| error!("{e}"));
+            let _ = tx
+                .send(line)
+                .await
+                .map_err(|error| error!(error = &error as &dyn std::error::Error));
         }
     });
     let status = handle.wait().await?;
