@@ -272,15 +272,14 @@ struct CreateProjectFromTemplateRequest {
         (status = 500, description = "Server internal error.")
     ),
 )]
-async fn create_project_from_template(
-    // State(RouterState {
+async fn create_project_from_template(// State(RouterState {
     //     service, sender, ..
     // }): State<RouterState>,
     // User { name, claim, .. }: User,
     // CustomErrorPath(project_name): CustomErrorPath<ProjectName>,
-    mut multipart: Multipart,
+    // mut multipart: Multipart,
 ) {
-    println!("ZIPPPP");
+    println!(r#"Creating project "{name}" in "{}""#, dest.display());
 
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
