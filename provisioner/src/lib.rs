@@ -14,14 +14,13 @@ use rand::Rng;
 use shuttle_common::backends::auth::VerifyClaim;
 use shuttle_common::backends::client::gateway;
 use shuttle_common::backends::ClaimExt;
-use shuttle_common::claims::Scope;
+use shuttle_common::claims::{Claim, Scope};
 use shuttle_common::models::project::ProjectName;
 pub use shuttle_proto::provisioner::provisioner_server::ProvisionerServer;
 use shuttle_proto::provisioner::{
-    aws_rds, database_request::DbType, shared, AwsRds, DatabaseRequest, DatabaseResponse, Shared,
+    aws_rds, database_request::DbType, provisioner_server::Provisioner, shared, AwsRds,
+    DatabaseDeletionResponse, DatabaseRequest, DatabaseResponse, Ping, Pong, Shared,
 };
-use shuttle_proto::provisioner::{provisioner_server::Provisioner, DatabaseDeletionResponse};
-use shuttle_proto::provisioner::{ContainerRequest, ContainerResponse, Ping, Pong};
 use shuttle_proto::resource_recorder;
 use sqlx::{postgres::PgPoolOptions, ConnectOptions, Executor, PgPool};
 use tokio::sync::Mutex;
@@ -461,6 +460,21 @@ impl ShuttleProvisioner {
 
         Ok(DatabaseDeletionResponse {})
     }
+
+    async fn verify_ownership(&self, claim: &Claim, project_name: &str) -> Result<(), Status> {
+        if !claim.is_admin()
+            && !claim.is_deployer()
+            && !claim
+                .owns_project(&self.gateway_client, project_name)
+                .await
+                .map_err(|_| Status::internal("could not verify project ownership"))?
+        {
+            let status = Status::permission_denied("the request lacks the authorizations");
+            error!(error = &status as &dyn std::error::Error);
+            return Err(status);
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -471,13 +485,13 @@ impl Provisioner for ShuttleProvisioner {
         request: Request<DatabaseRequest>,
     ) -> Result<Response<DatabaseResponse>, Status> {
         request.verify(Scope::ResourcesWrite)?;
-
         let claim = request.get_claim()?;
-
         let request = request.into_inner();
         if !ProjectName::is_valid(&request.project_name) {
             return Err(Status::invalid_argument("invalid project name"));
         }
+        self.verify_ownership(&claim, &request.project_name).await?;
+
         let db_type = request.db_type.unwrap();
 
         let reply = match db_type {
@@ -527,11 +541,13 @@ impl Provisioner for ShuttleProvisioner {
         request: Request<DatabaseRequest>,
     ) -> Result<Response<DatabaseDeletionResponse>, Status> {
         request.verify(Scope::ResourcesWrite)?;
-
+        let claim = request.get_claim()?;
         let request = request.into_inner();
         if !ProjectName::is_valid(&request.project_name) {
             return Err(Status::invalid_argument("invalid project name"));
         }
+        self.verify_ownership(&claim, &request.project_name).await?;
+
         let db_type = request.db_type.unwrap();
 
         let reply = match db_type {
@@ -546,17 +562,6 @@ impl Provisioner for ShuttleProvisioner {
         };
 
         Ok(Response::new(reply))
-    }
-
-    #[tracing::instrument(skip(self))]
-    async fn provision_arbitrary_container(
-        &self,
-        _request: Request<ContainerRequest>,
-    ) -> Result<Response<ContainerResponse>, Status> {
-        // Intended for use in local runs
-        Err(Status::unimplemented(
-            "Provisioning arbitrary containers on Shuttle is not supported",
-        ))
     }
 
     #[tracing::instrument(skip(self))]

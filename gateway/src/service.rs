@@ -64,7 +64,6 @@ pub struct ContainerSettingsBuilder {
     prefix: Option<String>,
     image: Option<String>,
     provisioner: Option<String>,
-    builder: Option<String>,
     auth_uri: Option<String>,
     resource_recorder_uri: Option<String>,
     network_name: Option<String>,
@@ -84,7 +83,6 @@ impl ContainerSettingsBuilder {
             prefix: None,
             image: None,
             provisioner: None,
-            builder: None,
             auth_uri: None,
             resource_recorder_uri: None,
             network_name: None,
@@ -98,7 +96,6 @@ impl ContainerSettingsBuilder {
             prefix,
             network_name,
             provisioner_host,
-            builder_host,
             auth_uri,
             resource_recorder_uri,
             image,
@@ -109,7 +106,6 @@ impl ContainerSettingsBuilder {
         self.prefix(prefix)
             .image(image)
             .provisioner_host(provisioner_host)
-            .builder_host(builder_host)
             .auth_uri(auth_uri)
             .resource_recorder_uri(resource_recorder_uri)
             .network_name(network_name)
@@ -131,11 +127,6 @@ impl ContainerSettingsBuilder {
 
     pub fn provisioner_host<S: ToString>(mut self, host: S) -> Self {
         self.provisioner = Some(host.to_string());
-        self
-    }
-
-    pub fn builder_host<S: ToString>(mut self, host: S) -> Self {
-        self.builder = Some(host.to_string());
         self
     }
 
@@ -168,7 +159,6 @@ impl ContainerSettingsBuilder {
         let prefix = self.prefix.take().unwrap();
         let image = self.image.take().unwrap();
         let provisioner_host = self.provisioner.take().unwrap();
-        let builder_host = self.builder.take().unwrap();
         let auth_uri = self.auth_uri.take().unwrap();
         let resource_recorder_uri = self.resource_recorder_uri.take().unwrap();
         let extra_hosts = self.extra_hosts.take().unwrap();
@@ -180,7 +170,6 @@ impl ContainerSettingsBuilder {
             prefix,
             image,
             provisioner_host,
-            builder_host,
             auth_uri,
             resource_recorder_uri,
             network_name,
@@ -195,7 +184,6 @@ pub struct ContainerSettings {
     pub prefix: String,
     pub image: String,
     pub provisioner_host: String,
-    pub builder_host: String,
     pub auth_uri: String,
     pub resource_recorder_uri: String,
     pub network_name: String,
@@ -396,8 +384,11 @@ impl GatewayService {
                 state: r
                     .try_get::<SqlxJson<Project>, _>("project_state")
                     .map(|p| p.0)
-                    .unwrap_or_else(|e| {
-                        error!(error = ?e, "Failed to deser `project_state`");
+                    .unwrap_or_else(|err| {
+                        error!(
+                            error = &err as &dyn std::error::Error,
+                            "Failed to deser `project_state`"
+                        );
                         Project::Errored(ProjectError::internal(
                             "Error when trying to deserialize state of project.",
                         ))
@@ -447,8 +438,11 @@ impl GatewayService {
                     // This can be invalid JSON if it refers to an outdated Project state
                     row.try_get::<SqlxJson<Project>, _>("project_state")
                         .map(|p| p.0)
-                        .unwrap_or_else(|e| {
-                            error!(error = ?e, "Failed to deser `project_state`");
+                        .unwrap_or_else(|err| {
+                            error!(
+                                error = &err as &dyn std::error::Error,
+                                "Failed to deser `project_state`"
+                            );
                             Project::Errored(ProjectError::internal(
                                 "Error when trying to deserialize state of project.",
                             ))
@@ -542,8 +536,11 @@ impl GatewayService {
             let project = row
                 .try_get::<SqlxJson<Project>, _>("project_state")
                 .map(|p| p.0)
-                .unwrap_or_else(|e| {
-                    error!(error = ?e, "Failed to deser `project_state`");
+                .unwrap_or_else(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        "Failed to deser `project_state`"
+                    );
                     Project::Errored(ProjectError::internal(
                         "Error when trying to deserialize state of project.",
                     ))
@@ -1002,16 +999,26 @@ impl DockerContext for GatewayContext {
     async fn get_stats(&self, container_id: &str) -> Result<u64, Error> {
         match self.docker_stats_source {
             DockerStatsSource::CgroupV1 => {
-                let cpu_usage: u64 =
-                tokio::fs::read_to_string(format!("{DOCKER_STATS_PATH_CGROUP_V1}/{container_id}/cpuacct.usage"))
-                .await.map_err(|e| {
-                    error!(error = %e, shuttle.container.id = container_id, "failed to read docker stats file for container");
+                let cpu_usage: u64 = tokio::fs::read_to_string(format!(
+                    "{DOCKER_STATS_PATH_CGROUP_V1}/{container_id}/cpuacct.usage"
+                ))
+                .await
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to read docker stats file for container"
+                    );
                     ProjectError::internal("failed to read docker stats file for container")
                 })?
                 .trim()
                 .parse()
-                .map_err(|e| {
-                    error!(error = %e, shuttle.container.id = container_id, "failed to parse cpu usage stat");
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to parse cpu usage stat"
+                    );
 
                     ProjectError::internal("failed to parse cpu usage to u64")
                 })?;
@@ -1022,28 +1029,49 @@ impl DockerContext for GatewayContext {
                 let cpu_usage: u64 = tokio::fs::read_to_string(format!(
                     "{DOCKER_STATS_PATH_CGROUP_V2}/docker-{container_id}.scope/cpu.stat"
                 ))
-                    .await
-                    .map_err(|e| {
-                        error!(error = %e, shuttle.container.id = container_id, "failed to read docker stats file for container");
-                        ProjectError::internal("failed to read docker stats file for container")
-                    })?
-                    .lines()
-                    .next()
-                    .ok_or_else(|| {
-                        error!(shuttle.container.id = container_id, "failed to read first line of docker stats file for container");
-                        ProjectError::internal("failed to read first line of docker stats file for container")
-                    })?
-                    .split(' ')
-                    .nth(1)
-                    .ok_or_else(|| {
-                        error!(shuttle.container.id = container_id, "failed to split docker stats line for container");
-                        ProjectError::internal("failed to split docker stats line for container")
-                    })?
-                    .parse::<u64>()
-                    .map_err(|e| {
-                        error!(error = %e, shuttle.container.id = container_id, "failed to parse cpu usage stat");
-                        ProjectError::internal("failed to parse cpu usage to u64")
-                    })?;
+                .await
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to read docker stats file for container"
+                    );
+                    ProjectError::internal("failed to read docker stats file for container")
+                })?
+                .lines()
+                .next()
+                .ok_or_else(|| {
+                    let err = ProjectError::internal(
+                        "failed to read first line of docker stats file for container",
+                    );
+                    error!(
+                        shuttle.container.id = container_id,
+                        error = &err as &dyn std::error::Error,
+                    );
+
+                    err
+                })?
+                .split(' ')
+                .nth(1)
+                .ok_or_else(|| {
+                    let err =
+                        ProjectError::internal("failed to split docker stats line for container");
+                    error!(
+                        shuttle.container.id = container_id,
+                        error = &err as &dyn std::error::Error,
+                    );
+
+                    err
+                })?
+                .parse::<u64>()
+                .map_err(|err| {
+                    error!(
+                        error = &err as &dyn std::error::Error,
+                        shuttle.container.id = container_id,
+                        "failed to parse cpu usage stat"
+                    );
+                    ProjectError::internal("failed to parse cpu usage to u64")
+                })?;
                 Ok(cpu_usage * 1_000)
             }
             DockerStatsSource::Bollard => {

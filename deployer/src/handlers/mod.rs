@@ -39,7 +39,7 @@ use shuttle_proto::logger::LogsRequest;
 
 use crate::persistence::{Deployment, Persistence, State};
 use crate::{
-    deployment::{Built, DeploymentManager, Queued},
+    deployment::{DeploymentManager, Queued},
     persistence::resource::ResourceManager,
 };
 pub use {self::error::Error, self::error::Result, self::local::set_jwt_bearer};
@@ -235,7 +235,10 @@ pub async fn get_service_resources(
         .filter_map(|resource| {
             resource
                 .map_err(|err| {
-                    error!(error = ?err, "failed to parse resource data");
+                    error!(
+                        error = err.as_ref() as &dyn std::error::Error,
+                        "failed to parse resource data"
+                    );
                 })
                 .ok()
         })
@@ -427,32 +430,10 @@ pub async fn delete_deployment(
     }
 }
 
-#[instrument(skip_all, fields(shuttle.project.name = %project_name, %deployment_id))]
-pub async fn start_deployment(
-    Extension(persistence): Extension<Persistence>,
-    Extension(deployment_manager): Extension<DeploymentManager>,
-    Extension(claim): Extension<Claim>,
-    Extension(project_id): Extension<Ulid>,
-    CustomErrorPath((project_name, deployment_id)): CustomErrorPath<(String, Uuid)>,
-) -> Result<()> {
-    if let Some(deployment) = persistence.get_runnable_deployment(&deployment_id).await? {
-        let built = Built {
-            id: deployment.id,
-            service_name: deployment.service_name,
-            service_id: deployment.service_id,
-            project_id,
-            tracing_context: Default::default(),
-            is_next: deployment.is_next,
-            claim,
-            secrets: Default::default(),
-        };
-        deployment_manager.run_push(built).await;
-
-        Ok(())
-    } else {
-        Err(Error::NotFound("deployment not found".to_string()))
-    }
-}
+/// Deprecated.
+/// Now always starts the last running deployment on start up / wake up.
+/// Kept around for compatibility.
+pub async fn start_deployment() {}
 
 #[instrument(skip_all, fields(shuttle.project.name = %project_name, %deployment_id))]
 pub async fn get_logs(
@@ -477,7 +458,10 @@ pub async fn get_logs(
                 .collect(),
         )),
         Err(error) => {
-            error!(error = %error, "failed to retrieve logs for deployment");
+            error!(
+                error = &error as &dyn std::error::Error,
+                "failed to retrieve logs for deployment"
+            );
             Err(anyhow!("failed to retrieve logs for deployment").into())
         }
     }
@@ -600,7 +584,7 @@ where
         state: &S,
     ) -> std::result::Result<Self, Self::Rejection> {
         let bytes = Bytes::from_request(req, state).await.map_err(|_| {
-            error!("failed to collect body bytes, is the body too large?");
+            info!("failed to collect body bytes, is the body too large?");
             StatusCode::PAYLOAD_TOO_LARGE
         })?;
 

@@ -1,6 +1,6 @@
 [package]
 name = "cargo-shuttle"
-version = "0.39.0"
+version = "0.40.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ homepage = "https://www.shuttle.rs"
 
 [dependencies]
 shuttle-common = { workspace = true, features = ["models"] }
-shuttle-proto = { workspace = true, features = ["provisioner", "runtime"] }
+shuttle-proto = { workspace = true, features = ["provisioner", "runtime-client"] }
 shuttle-service = { workspace = true, features = ["builder", "runner"] }
 
 anyhow = { workspace = true }

@@ -28,8 +28,8 @@
 //!
 //! ```toml
 //! axum = "0.7.3"
-//! shuttle-axum = "0.39.0"
-//! shuttle-runtime = "0.39.0"
+//! shuttle-axum = "0.40.0"
+//! shuttle-runtime = "0.40.0"
 //! tokio = "1.28.2"
 //! ```
 //!
@@ -112,7 +112,7 @@
 //! `runtime-tokio-native-tls` and `postgres` features inside `Cargo.toml`:
 //!
 //! ```toml
-//! shuttle-shared-db = { version = "0.39.0", features = ["postgres"] }
+//! shuttle-shared-db = { version = "0.40.0", features = ["postgres"] }
 //! sqlx = "0.7.1"
 //! ```
 //!
@@ -205,7 +205,9 @@
 
 // Public API
 pub use shuttle_codegen::main;
-pub use shuttle_service::{CustomError, Error, Factory, IntoResource, ResourceBuilder, Service};
+pub use shuttle_service::{
+    CustomError, DbInput, Error, IntoResource, ResourceFactory, ResourceInputBuilder, Service,
+};
 
 // Useful re-exports
 pub use async_trait::async_trait;
@@ -215,8 +217,6 @@ mod alpha;
 mod args;
 #[cfg(feature = "next")]
 mod next;
-mod provisioner_factory;
-mod resource_tracker;
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -228,13 +228,12 @@ pub mod __internals {
     pub use crate::alpha::{start, Alpha};
     #[cfg(feature = "next")]
     pub use crate::next::{AxumWasm, NextArgs};
-    pub use crate::provisioner_factory::ProvisionerFactory;
-    pub use crate::resource_tracker::{get_resource, ResourceTracker};
 
     // Dependencies required by the codegen
     pub use anyhow::Context;
     #[cfg(feature = "setup-tracing")]
     pub use colored;
+    pub use serde_json;
     pub use strfmt::strfmt;
     #[cfg(feature = "setup-tracing")]
     pub use tracing_subscriber;

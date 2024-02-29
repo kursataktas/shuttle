@@ -38,10 +38,10 @@ pub struct ShuttleArgs {
 }
 
 // Common args for subcommands that deal with projects.
-#[derive(Parser, Debug)]
+#[derive(Parser, Clone, Debug)]
 pub struct ProjectArgs {
     /// Specify the working directory
-    #[arg(global = true, long, visible_alias = "wd", default_value = ".", value_parser = OsStringValueParser::new().try_map(parse_init_path))]
+    #[arg(global = true, long, visible_alias = "wd", default_value = ".", value_parser = OsStringValueParser::new().try_map(parse_path))]
     pub working_directory: PathBuf,
     /// Specify the name of the project (overrides crate name)
     #[arg(global = true, long)]
@@ -259,7 +259,7 @@ pub struct LogoutArgs {
     #[arg(long)]
     pub reset_api_key: bool,
 }
-#[derive(Parser)]
+#[derive(Parser, Default)]
 pub struct DeployArgs {
     /// Allow deployment with uncommitted files
     #[arg(long, visible_alias = "ad")]
@@ -267,6 +267,9 @@ pub struct DeployArgs {
     /// Don't run pre-deploy tests
     #[arg(long, visible_alias = "nt")]
     pub no_test: bool,
+
+    #[command(flatten)]
+    pub secret_args: SecretsArgs,
 }
 
 #[derive(Parser, Debug)]
@@ -280,6 +283,16 @@ pub struct RunArgs {
     /// Use release mode for building the project
     #[arg(long, short = 'r')]
     pub release: bool,
+
+    #[command(flatten)]
+    pub secret_args: SecretsArgs,
+}
+
+#[derive(Parser, Debug, Default)]
+pub struct SecretsArgs {
+    /// Use this secrets file instead
+    #[arg(long, value_parser = OsStringValueParser::new().try_map(parse_path))]
+    pub secrets: Option<PathBuf>,
 }
 
 #[derive(Parser, Clone, Debug, Default)]
@@ -295,7 +308,7 @@ pub struct InitArgs {
     pub subfolder: Option<String>,
 
     /// Path where to place the new Shuttle project
-    #[arg(default_value = ".", value_parser = OsStringValueParser::new().try_map(parse_init_path))]
+    #[arg(default_value = ".", value_parser = OsStringValueParser::new().try_map(create_and_parse_path))]
     pub path: PathBuf,
 
     /// Don't check the project name's validity or availability and use it anyways
@@ -393,12 +406,17 @@ impl InitTemplateArg {
 }
 
 /// Helper function to parse and return the absolute path
-fn parse_path(path: OsString) -> Result<PathBuf, String> {
-    dunce::canonicalize(&path).map_err(|e| format!("could not turn {path:?} into a real path: {e}"))
+fn parse_path(path: OsString) -> Result<PathBuf, io::Error> {
+    dunce::canonicalize(&path).map_err(|e| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("could not turn {path:?} into a real path: {e}"),
+        )
+    })
 }
 
 /// Helper function to parse, create if not exists, and return the absolute path
-pub(crate) fn parse_init_path(path: OsString) -> Result<PathBuf, io::Error> {
+pub(crate) fn create_and_parse_path(path: OsString) -> Result<PathBuf, io::Error> {
     // Create the directory if does not exist
     create_dir_all(&path).map_err(|e| {
         io::Error::new(
@@ -407,7 +425,7 @@ pub(crate) fn parse_init_path(path: OsString) -> Result<PathBuf, io::Error> {
         )
     })?;
 
-    parse_path(path).map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))
+    parse_path(path)
 }
 
 #[cfg(test)]

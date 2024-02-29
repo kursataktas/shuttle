@@ -23,7 +23,6 @@ RUSTUP_TOOLCHAIN=1.76.0
 
 TAG?=$(shell git describe --tags --abbrev=0)
 AUTH_TAG?=$(TAG)
-BUILDER_TAG?=$(TAG)
 DEPLOYER_TAG?=$(TAG)
 GATEWAY_TAG?=$(TAG)
 LOGGER_TAG?=$(TAG)
@@ -58,7 +57,7 @@ CONTAINER_REGISTRY=public.ecr.aws/shuttle
 # make sure we only ever go to production with `--tls=enable`
 USE_TLS=enable
 CARGO_PROFILE=release
-RUST_LOG?=nbuild_core=warn,shuttle=debug,info
+RUST_LOG?=shuttle=debug,info
 else
 DOCKER_COMPOSE_FILES=docker-compose.yml docker-compose.dev.yml
 STACK?=shuttle-dev
@@ -68,7 +67,7 @@ CONTAINER_REGISTRY=public.ecr.aws/shuttle-dev
 USE_TLS?=disable
 # default for local run
 CARGO_PROFILE?=debug
-RUST_LOG?=nbuild_core=warn,shuttle=debug,info
+RUST_LOG?=shuttle=debug,info
 DEV_SUFFIX=-dev
 DEPLOYS_API_KEY?=gateway4deployes
 GATEWAY_ADMIN_KEY?=dh9z58jttoes3qvt
@@ -104,7 +103,6 @@ endif
 DOCKER_COMPOSE_ENV=\
 	STACK=$(STACK)\
 	AUTH_TAG=$(AUTH_TAG)\
-	BUILDER_TAG=$(BUILDER_TAG)\
 	DEPLOYER_TAG=$(DEPLOYER_TAG)\
 	GATEWAY_TAG=$(GATEWAY_TAG)\
 	LOGGER_TAG=$(LOGGER_TAG)\
@@ -136,18 +134,18 @@ DOCKER_COMPOSE_ENV=\
 	SHUTTLE_ENV=$(SHUTTLE_ENV)\
 	SHUTTLE_SERVICE_VERSION=$(SHUTTLE_SERVICE_VERSION)
 
-.PHONY: clean cargo-clean images the-shuttle-images shuttle-% postgres otel deploy test docker-compose.rendered.yml up down
+.PHONY: clean deep-clean images the-shuttle-images shuttle-% postgres otel deploy test docker-compose.rendered.yml up down
 
 clean:
 	rm .shuttle-*
 	rm docker-compose.rendered.yml
 
-cargo-clean:
-	find . -type d \( -name target -or -name .shuttle-executables \) | xargs rm -rf
+deep-clean:
+	find . -type d \( -name target -or -name .shuttle-executables -or -name node_modules \) | xargs rm -rf
 
 images: the-shuttle-images postgres otel
 
-the-shuttle-images: shuttle-auth shuttle-deployer shuttle-gateway shuttle-logger shuttle-provisioner shuttle-resource-recorder # shuttle-builder
+the-shuttle-images: shuttle-auth shuttle-deployer shuttle-gateway shuttle-logger shuttle-provisioner shuttle-resource-recorder
 
 shuttle-%:
 	$(DOCKER_BUILD) \

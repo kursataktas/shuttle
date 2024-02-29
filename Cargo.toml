@@ -3,7 +3,6 @@ resolver = "2"
 members = [
   "admin",
   "auth",
-  "builder",
   "cargo-shuttle",
   "codegen",
   "common",
@@ -26,19 +25,19 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.39.0"
+version = "0.40.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/shuttle-hq/shuttle"
 
 # https://doc.rust-lang.org/cargo/reference/workspaces.html#the-workspacedependencies-table
 [workspace.dependencies]
-shuttle-codegen = { path = "codegen", version = "0.39.0" }
-shuttle-common = { path = "common", version = "0.39.0" }
-shuttle-common-tests = { path = "common-tests", version = "0.39.0" }
-shuttle-orchestrator = { path = "orchestrator", version = "0.39.0" }
-shuttle-proto = { path = "proto", version = "0.39.0" }
-shuttle-service = { path = "service", version = "0.39.0" }
+shuttle-codegen = { path = "codegen", version = "0.40.0" }
+shuttle-common = { path = "common", version = "0.40.0" }
+shuttle-common-tests = { path = "common-tests", version = "0.40.0" }
+shuttle-orchestrator = { path = "orchestrator", version = "0.40.0" }
+shuttle-proto = { path = "proto", version = "0.40.0" }
+shuttle-service = { path = "service", version = "0.40.0" }
 
 anyhow = "1.0.66"
 async-trait = "0.1.58"
@@ -100,7 +99,6 @@ tonic = "0.10.2"
 tower = "0.4.13"
 tower-http = { version = "0.4.0", features = ["trace"] }
 tracing = { version = "0.1.37", default-features = false }
-tracing-core = { version = "0.1.32", default-features = false }
 tracing-opentelemetry = "0.22.0"
 tracing-subscriber = { version = "0.3.16", default-features = false, features = [
   "registry",

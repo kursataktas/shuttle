@@ -23,7 +23,6 @@ use shuttle_common::models::error::{ApiError, ErrorKind};
 use shuttle_common::models::project::ProjectName;
 use strum::Display;
 use tokio::sync::mpsc::error::SendError;
-use tracing::error;
 
 pub mod acme;
 pub mod api;
@@ -114,11 +113,13 @@ impl From<AcmeClientError> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let error: ApiError = self.kind.into();
+        let error: ApiError = self.kind.clone().into();
 
         if error.status_code >= 500 {
-            // We only want to emit error events for internal errors, not e.g. 404s.
-            error!(error = error.message, "control plane request error");
+            tracing::error!(
+                error = &self as &dyn std::error::Error,
+                "control plane request error"
+            );
         }
 
         error.into_response()
@@ -558,7 +559,6 @@ pub mod tests {
                 env::var("SHUTTLE_TESTS_NETWORK").unwrap_or_else(|_| "shuttle_default".to_string());
 
             let provisioner_host = "provisioner".to_string();
-            let builder_host = "builder".to_string();
 
             let docker_host = "/var/run/docker.sock".to_string();
 
@@ -572,7 +572,6 @@ pub mod tests {
                     image,
                     prefix,
                     provisioner_host,
-                    builder_host,
                     // The started containers need to reach auth on the host.
                     // For this to work, the firewall should not be blocking traffic on the `SHUTTLE_TEST_NETWORK` interface.
                     // The following command can be used on NixOs to allow traffic on the interface.

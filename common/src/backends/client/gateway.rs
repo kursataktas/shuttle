@@ -36,6 +36,16 @@ impl Client {
 /// Interact with all the data relating to projects
 #[allow(async_fn_in_trait)]
 pub trait ProjectsDal {
+    /// Get a user project
+    async fn get_user_project(
+        &self,
+        user_token: &str,
+        project_name: &str,
+    ) -> Result<models::project::Response, Error>;
+
+    /// Check the HEAD of a user project
+    async fn head_user_project(&self, user_token: &str, project_name: &str) -> Result<bool, Error>;
+
     /// Get the projects that belong to a user
     async fn get_user_projects(
         &self,
@@ -57,21 +67,48 @@ pub trait ProjectsDal {
 
 impl ProjectsDal for Client {
     #[instrument(skip_all)]
+    async fn get_user_project(
+        &self,
+        user_token: &str,
+        project_name: &str,
+    ) -> Result<models::project::Response, Error> {
+        self.public_client
+            .request(
+                Method::GET,
+                format!("projects/{}", project_name).as_str(),
+                None::<()>,
+                Some(Authorization::bearer(user_token).expect("to build an authorization bearer")),
+            )
+            .await
+    }
+
+    #[instrument(skip_all)]
+    async fn head_user_project(&self, user_token: &str, project_name: &str) -> Result<bool, Error> {
+        self.public_client
+            .request_raw(
+                Method::HEAD,
+                format!("projects/{}", project_name).as_str(),
+                None::<()>,
+                Some(Authorization::bearer(user_token).expect("to build an authorization bearer")),
+            )
+            .await?;
+
+        Ok(true)
+    }
+
+    #[instrument(skip_all)]
     async fn get_user_projects(
         &self,
         user_token: &str,
     ) -> Result<Vec<models::project::Response>, Error> {
-        let projects = self
-            .public_client
+        self.public_client
             .request(
                 Method::GET,
                 "projects",
                 None::<()>,
                 Some(Authorization::bearer(user_token).expect("to build an authorization bearer")),
             )
-            .await?;
-
-        Ok(projects)
+            .await
     }
 }
 
@@ -105,13 +142,13 @@ mod tests {
             res,
             vec![
                 Response {
-                    id: "id1".to_string(),
+                    id: "00000000000000000000000001".to_string(),
                     name: "user-1-project-1".to_string(),
                     state: State::Stopped,
                     idle_minutes: Some(30)
                 },
                 Response {
-                    id: "id2".to_string(),
+                    id: "00000000000000000000000002".to_string(),
                     name: "user-1-project-2".to_string(),
                     state: State::Ready,
                     idle_minutes: Some(30)
@@ -125,6 +162,6 @@ mod tests {
     async fn get_user_project_ids(client: &mut Client) {
         let res = client.get_user_project_ids("user-2").await.unwrap();
 
-        assert_eq!(res, vec!["id3"])
+        assert_eq!(res, vec!["00000000000000000000000003"])
     }
 }
