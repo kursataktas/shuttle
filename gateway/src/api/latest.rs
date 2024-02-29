@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
+use axum::extract::Multipart;
 use axum::extract::{Extension, Path, Query, State};
 use axum::handler::Handler;
 use axum::http::Request;
@@ -16,6 +17,7 @@ use fqdn::FQDN;
 use futures::Future;
 use http::{Method, StatusCode, Uri};
 use instant_acme::{AccountCredentials, ChallengeType};
+// use ring::test::File;
 use serde::{Deserialize, Serialize};
 use shuttle_common::backends::auth::{AuthPublicKey, JwtAuthenticationLayer, ScopedLayer};
 use shuttle_common::backends::cache::CacheManager;
@@ -254,6 +256,43 @@ async fn create_project(
     };
 
     Ok(AxumJson(response))
+}
+
+#[derive(Deserialize)]
+struct CreateProjectFromTemplateRequest {
+    template: String,
+}
+
+#[instrument(skip_all)]
+#[utoipa::path(
+    post,
+    path = "/projects",
+    responses(
+        (status = 200, description = "Successfully created a specific project.", body = shuttle_common::models::project::Response),
+        (status = 500, description = "Server internal error.")
+    ),
+)]
+async fn create_project_from_template(
+    // State(RouterState {
+    //     service, sender, ..
+    // }): State<RouterState>,
+    // User { name, claim, .. }: User,
+    // CustomErrorPath(project_name): CustomErrorPath<ProjectName>,
+    mut multipart: Multipart,
+) {
+    println!("ZIPPPP");
+
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        let name = field.name().unwrap().to_string();
+        let file_name = field.file_name().unwrap().to_string();
+        let content_type = field.content_type().unwrap().to_string();
+        let data = field.bytes().await.unwrap();
+
+        println!(
+            "Length of `{name}` (`{file_name}`: `{content_type}`) is {} bytes",
+            data.len()
+        );
+    }
 }
 
 #[instrument(skip_all, fields(shuttle.project.name = %project_name))]
@@ -1111,7 +1150,9 @@ impl ApiBuilder {
             )
             .route(
                 "/projects",
-                get(get_projects_list.layer(ScopedLayer::new(vec![Scope::Project]))),
+                get(get_projects_list.layer(ScopedLayer::new(vec![Scope::Project]))).post(
+                    create_project_from_template.layer(ScopedLayer::new(vec![Scope::ProjectWrite])),
+                ),
             )
             .route(
                 "/projects/:project_name",
