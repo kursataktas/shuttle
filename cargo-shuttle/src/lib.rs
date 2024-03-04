@@ -398,31 +398,34 @@ impl Shuttle {
         let path = if needs_path {
             let path = args
                 .path
-                .to_str()
-                .context("path arg should always be set")?;
+                .join(project_args.name.as_ref().expect("name should be set"));
 
-            println!("Where should we create this project?");
-            let directory_str: String = Input::with_theme(&theme)
-                .with_prompt("Directory")
-                .default(path.to_owned())
-                .interact()?;
-            println!();
+            loop {
+                println!("Where should we create this project?");
 
-            let path = args::create_and_parse_path(OsString::from(directory_str))?;
+                let directory_str: String = Input::with_theme(&theme)
+                    .with_prompt("Directory")
+                    .default(format!("{}", path.display()))
+                    .interact()?;
+                println!();
 
-            if std::fs::read_dir(&path)
-                .expect("init dir to exist and list entries")
-                .count()
-                > 0
-                && !Confirm::with_theme(&theme)
-                    .with_prompt("Target directory is not empty. Are you sure?")
-                    .default(true)
-                    .interact()?
-            {
-                return Ok(CommandOutcome::Ok);
+                let path = args::create_and_parse_path(OsString::from(directory_str))?;
+
+                if std::fs::read_dir(&path)
+                    .expect("init dir to exist and list entries")
+                    .count()
+                    > 0
+                    && !Confirm::with_theme(&theme)
+                        .with_prompt("Target directory is not empty. Are you sure?")
+                        .default(true)
+                        .interact()?
+                {
+                    println!();
+                    continue;
+                }
+
+                break path;
             }
-
-            path
         } else {
             args.path.clone()
         };
@@ -1203,6 +1206,7 @@ impl Shuttle {
                             prov.provision_database(Request::new(DatabaseRequest {
                                 project_name: project_name.to_string(),
                                 db_type: Some(db_type.into()),
+                                db_name: config.db_name,
                             }))
                             .await?
                             .into_inner()
@@ -1489,7 +1493,6 @@ impl Shuttle {
     #[cfg(target_family = "windows")]
     async fn local_run(&self, mut run_args: RunArgs) -> Result<CommandOutcome> {
         let services = self.pre_local_run(&run_args).await?;
-        let (provisioner_server, provisioner_port) = Shuttle::setup_local_provisioner().await?;
 
         // Start all the services.
         let mut runtimes: Vec<(Child, runtime::Client)> = Vec::new();
@@ -1499,8 +1502,8 @@ impl Shuttle {
         let mut signal_received = false;
         for (i, service) in services.iter().enumerate() {
             signal_received = tokio::select! {
-                res = Shuttle::spin_local_runtime(&run_args, service, &provisioner_server, i as u16, provisioner_port) => {
-                    Shuttle::add_runtime_info(res.unwrap(), &mut runtimes, &[&provisioner_server]).await?;
+                res = Shuttle::spin_local_runtime(&run_args, service, i as u16) => {
+                    Shuttle::add_runtime_info(res.unwrap(), &mut runtimes).await?;
                     false
                 },
                 _ = Shuttle::handle_signals() => {
@@ -1519,7 +1522,6 @@ impl Shuttle {
         // If prior signal received is set to true we must stop all the existing runtimes and
         // exit the `local_run`.
         if signal_received {
-            provisioner_server.abort();
             for (mut rt, mut rt_client) in runtimes {
                 Shuttle::stop_runtime(&mut rt, &mut rt_client)
                     .await
@@ -1557,7 +1559,6 @@ impl Shuttle {
                     println!(
                         "Killing all the runtimes..."
                     );
-                    provisioner_server.abort();
                     Shuttle::stop_runtime(&mut rt, &mut rt_client).await.unwrap_or_else(|err| {
                         trace!(status = ?err, "stopping the runtime errored out");
                     });
