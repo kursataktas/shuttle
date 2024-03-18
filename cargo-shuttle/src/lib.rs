@@ -72,7 +72,7 @@ use uuid::Uuid;
 
 pub use crate::args::{Command, ProjectArgs, RunArgs, ShuttleArgs};
 use crate::args::{
-    DeployArgs, DeploymentCommand, InitArgs, LoginArgs, LogoutArgs, ProjectCommand,
+    DeployArgs, DeploymentCommand, InitArgs, LoginArgs, LogoutArgs, LogsArgs, ProjectCommand,
     ProjectStartArgs, ResourceCommand, TemplateLocation,
 };
 use crate::client::Client;
@@ -222,12 +222,7 @@ impl Shuttle {
             Command::Run(run_args) => self.local_run(run_args).await,
             Command::Deploy(deploy_args) => self.deploy(deploy_args).await,
             Command::Status => self.status().await,
-            Command::Logs {
-                id,
-                latest,
-                follow,
-                raw,
-            } => self.logs(id, latest, follow, raw).await,
+            Command::Logs(logs_args) => self.logs(logs_args).await,
             Command::Deployment(DeploymentCommand::List { page, limit, raw }) => {
                 self.deployments_list(page, limit, raw).await
             }
@@ -448,7 +443,8 @@ impl Shuttle {
                 } else {
                     get_templates_schema()
                         .await
-                        .map_err(|_| {
+                        .map_err(|e| {
+                            error!(err = %e, "Failed to get templates");
                             println!(
                                 "{}",
                                 "Failed to look up template list. Falling back to internal list."
@@ -843,20 +839,14 @@ impl Shuttle {
         Ok(CommandOutcome::Ok)
     }
 
-    async fn logs(
-        &self,
-        id: Option<Uuid>,
-        latest: bool,
-        follow: bool,
-        raw: bool,
-    ) -> Result<CommandOutcome> {
+    async fn logs(&self, args: LogsArgs) -> Result<CommandOutcome> {
         let client = self.client.as_ref().unwrap();
-        let id = if let Some(id) = id {
+        let id = if let Some(id) = args.id {
             id
         } else {
             let proj_name = self.ctx.project_name();
 
-            if latest {
+            if args.latest {
                 // Find latest deployment (not always an active one)
                 let deployments = client
                     .get_deployments(proj_name, 0, 1)
@@ -883,7 +873,7 @@ impl Shuttle {
             }
         };
 
-        if follow {
+        if args.follow {
             let mut stream = client
                 .get_logs_ws(self.ctx.project_name(), &id)
                 .await
@@ -895,10 +885,10 @@ impl Shuttle {
                 if let tokio_tungstenite::tungstenite::Message::Text(line) = msg {
                     match serde_json::from_str::<shuttle_common::LogItem>(&line) {
                         Ok(log) => {
-                            if raw {
-                                println!("{}", log.get_raw_line());
+                            if args.raw {
+                                println!("{}", log.get_raw_line())
                             } else {
-                                println!("{log}");
+                                println!("{log}")
                             }
                         }
                         Err(err) => {
@@ -924,10 +914,10 @@ impl Shuttle {
                 })?;
 
             for log in logs.into_iter() {
-                if raw {
-                    println!("{}", log.get_raw_line());
+                if args.raw {
+                    println!("{}", log.get_raw_line())
                 } else {
-                    println!("{log}");
+                    println!("{log}")
                 }
             }
         }
@@ -1045,26 +1035,30 @@ impl Shuttle {
         service: &BuiltService,
         idx: u16,
     ) -> Result<Option<(Child, runtime::Client)>> {
-        let secrets_path = run_args.secret_args.secrets.clone().unwrap_or_else(|| {
+        let secrets_file = run_args.secret_args.secrets.clone().or_else(|| {
             let crate_dir = service.crate_directory();
-            if crate_dir.join("Secrets.dev.toml").exists() {
-                crate_dir.join("Secrets.dev.toml")
-            } else {
-                crate_dir.join("Secrets.toml")
-            }
+            // Prioritise crate-local prod secrets over workspace dev secrets (in the rare case that both exist)
+            [
+                crate_dir.join("Secrets.dev.toml"),
+                crate_dir.join("Secrets.toml"),
+                service.workspace_path.join("Secrets.dev.toml"),
+                service.workspace_path.join("Secrets.toml"),
+            ]
+            .into_iter()
+            .find(|f| f.exists() && f.is_file())
         });
-        trace!("Loading secrets from {}", secrets_path.display());
-
-        let secrets: HashMap<String, String> = if let Ok(secrets_str) = read_to_string(secrets_path)
-        {
-            let secrets: HashMap<String, String> =
-                secrets_str.parse::<toml::Value>()?.try_into()?;
-
-            trace!(keys = ?secrets.keys(), "available secrets");
-
-            secrets
+        let secrets = if let Some(secrets_file) = secrets_file {
+            trace!("Loading secrets from {}", secrets_file.display());
+            if let Ok(secrets_str) = read_to_string(secrets_file) {
+                let secrets = toml::from_str::<HashMap<String, String>>(&secrets_str)?;
+                trace!(keys = ?secrets.keys(), "available secrets");
+                secrets
+            } else {
+                trace!("No secrets were loaded");
+                Default::default()
+            }
         } else {
-            trace!("No secrets were loaded");
+            trace!("No secrets file was found");
             Default::default()
         };
 
@@ -1117,6 +1111,7 @@ impl Shuttle {
             .context("child process did not have a handle to stdout")?;
         let mut reader = BufReader::new(child_stdout).lines();
         let service_name_clone = service_name.clone();
+        let raw = run_args.raw;
         tokio::spawn(async move {
             while let Some(line) = reader.next_line().await.unwrap() {
                 let log_item = LogItem::new(
@@ -1124,7 +1119,12 @@ impl Shuttle {
                     shuttle_common::log::Backend::Runtime(service_name_clone.clone()),
                     line,
                 );
-                println!("{log_item}");
+
+                if raw {
+                    println!("{}", log_item.get_raw_line())
+                } else {
+                    println!("{log_item}")
+                }
             }
         });
 
@@ -1717,7 +1717,11 @@ impl Shuttle {
                         }
                     };
 
-                    println!("{log_item}");
+                    if args.raw {
+                        println!("{}", log_item.get_raw_line())
+                    } else {
+                        println!("{log_item}")
+                    }
 
                     // Detect versions of deployer and runtime, and print warnings of outdated.
                     if !deployer_version_checked
