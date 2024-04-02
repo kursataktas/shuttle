@@ -41,7 +41,13 @@ MONGO_INITDB_ROOT_USERNAME?=mongodb
 MONGO_INITDB_ROOT_PASSWORD?=password
 STRIPE_SECRET_KEY?=""
 AUTH_JWTSIGNING_PRIVATE_KEY?=""
+PERMIT_API_KEY?=""
 
+# log level set in all backends
+RUST_LOG?=shuttle=debug,info
+
+# production/staging/dev
+SHUTTLE_ENV?=dev
 DD_ENV=$(SHUTTLE_ENV)
 ifeq ($(SHUTTLE_ENV),production)
 DOCKER_COMPOSE_FILES=docker-compose.yml
@@ -52,8 +58,8 @@ CONTAINER_REGISTRY=public.ecr.aws/shuttle
 # make sure we only ever go to production with `--tls=enable`
 USE_TLS=enable
 CARGO_PROFILE=release
-RUST_LOG?=shuttle=debug,info
 else
+# add local development overrides to compose
 DOCKER_COMPOSE_FILES=docker-compose.yml docker-compose.dev.yml
 STACK?=shuttle-dev
 APPS_FQDN=unstable.shuttleapp.rs
@@ -62,7 +68,10 @@ CONTAINER_REGISTRY=public.ecr.aws/shuttle-dev
 USE_TLS?=disable
 # default for local run
 CARGO_PROFILE?=debug
-RUST_LOG?=shuttle=debug,info
+ifeq ($(CI),true)
+# use release builds for staging deploys so that the DLC cache can be re-used for prod deploys
+CARGO_PROFILE=release
+endif
 DEV_SUFFIX=-dev
 DEPLOYS_API_KEY?=gateway4deployes
 GATEWAY_ADMIN_KEY?=dh9z58jttoes3qvt
@@ -76,11 +85,6 @@ CONTROL_DB_POSTGRES_URI?=postgres://postgres:${CONTROL_DB_POSTGRES_PASSWORD}@con
 LOGGER_POSTGRES_TAG?=15
 LOGGER_POSTGRES_PASSWORD?=postgres
 LOGGER_POSTGRES_URI?=postgres://postgres:${LOGGER_POSTGRES_PASSWORD}@logger-postgres:5432/postgres
-endif
-
-ifeq ($(CI),true)
-# default for staging
-CARGO_PROFILE=release
 endif
 
 POSTGRES_EXTRA_PATH?=./extras/postgres
@@ -127,7 +131,8 @@ DOCKER_COMPOSE_ENV=\
 	COMPOSE_PROFILES=$(COMPOSE_PROFILES)\
 	DOCKER_SOCK=$(DOCKER_SOCK)\
 	SHUTTLE_ENV=$(SHUTTLE_ENV)\
-	SHUTTLE_SERVICE_VERSION=$(SHUTTLE_SERVICE_VERSION)
+	SHUTTLE_SERVICE_VERSION=$(SHUTTLE_SERVICE_VERSION)\
+	PERMIT_API_KEY=$(PERMIT_API_KEY)
 
 .PHONY: clean deep-clean images the-shuttle-images shuttle-% postgres otel deploy test docker-compose.rendered.yml up down
 
@@ -177,11 +182,6 @@ otel:
 
 deploy: docker-compose.yml
 	$(DOCKER_COMPOSE_ENV) docker stack deploy -c $< $(STACK)
-
-test:
-	POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
-	APPS_FQDN=$(APPS_FQDN) \
-	cargo test --manifest-path=e2e/Cargo.toml $(CARGO_TEST_FLAGS) -- --nocapture
 
 docker-compose.rendered.yml: docker-compose.yml docker-compose.dev.yml
 	$(DOCKER_COMPOSE_ENV) $(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.dev.yml $(DOCKER_COMPOSE_CONFIG_FLAGS) -p $(STACK) config > $@

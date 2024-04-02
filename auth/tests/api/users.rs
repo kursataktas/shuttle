@@ -48,6 +48,7 @@ mod needs_docker {
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let user: user::Response = serde_json::from_slice(&body).unwrap();
+        let user_id1 = user.id.clone();
 
         assert_eq!(user.name, "test-user");
         assert_eq!(user.account_tier, "basic");
@@ -61,11 +62,21 @@ mod needs_docker {
 
         let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
         let user: user::Response = serde_json::from_slice(&body).unwrap();
+        let user_id2 = user.id.clone();
 
         assert_eq!(user.name, "pro-user");
         assert_eq!(user.account_tier, "pro");
         assert!(user.id.starts_with("user_"));
         assert!(user.key.is_ascii());
+
+        assert_eq!(
+            *app.permissions.calls.lock().await,
+            [
+                format!("new_user {user_id1}"),
+                format!("new_user {user_id2}"),
+                format!("make_pro {user_id2}"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -153,9 +164,7 @@ mod needs_docker {
         let pro_user: user::Response = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(user.name, pro_user.name);
-
         assert_eq!(user.key, pro_user.key);
-
         assert_eq!(pro_user.account_tier, "pro");
 
         let mocked_subscription_obj: Value =
@@ -163,6 +172,11 @@ mod needs_docker {
         assert_eq!(
             pro_user.subscriptions.first().unwrap().id,
             mocked_subscription_obj.get("id").unwrap().as_str().unwrap()
+        );
+
+        assert_eq!(
+            *app.permissions.calls.lock().await,
+            [format!("new_user {user_id}"), format!("make_pro {user_id}")]
         );
     }
 
@@ -204,6 +218,15 @@ mod needs_docker {
         let actual_user: user::Response = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(actual_user.account_tier, "pendingpaymentpro");
+
+        assert_eq!(
+            *app.permissions.calls.lock().await,
+            [
+                format!("new_user {user_id}"),
+                format!("make_pro {user_id}"),
+                format!("make_basic {user_id}"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -269,6 +292,11 @@ mod needs_docker {
         // Make sure JWT is reset correctly
         let claim = app.get_claim(basic_user_key).await;
         assert_eq!(claim.limits.rds_quota(), 0);
+
+        assert_eq!(
+            *app.permissions.calls.lock().await,
+            [format!("new_user {user_id}")]
+        );
     }
 
     #[tokio::test]
@@ -355,5 +383,16 @@ mod needs_docker {
         let user: user::Response = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(user.account_tier, "basic");
+
+        assert_eq!(
+            *app.permissions.calls.lock().await,
+            [
+                format!("new_user {user_id}"),
+                format!("make_pro {user_id}"),
+                format!("make_basic {user_id}"),
+                format!("make_basic {user_id}"),
+                format!("make_basic {user_id}"),
+            ]
+        );
     }
 }

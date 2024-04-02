@@ -1,6 +1,6 @@
 [package]
 name = "shuttle-runtime"
-version = "0.42.0"
+version = "0.43.0"
 edition.workspace = true
 license.workspace = true
 description = "Runtime to start and manage any service that runs on shuttle"
@@ -16,13 +16,10 @@ shuttle-service = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 colored = { workspace = true, optional = true }
-prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strfmt = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

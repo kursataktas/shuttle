@@ -17,8 +17,8 @@ use hyper::client::HttpConnector;
 use hyper::Client;
 use once_cell::sync::Lazy;
 use service::ContainerSettings;
+use shuttle_backends::project_name::ProjectName;
 use shuttle_common::models::error::{ApiError, ErrorKind};
-use shuttle_common::models::project::ProjectName;
 use shuttle_common::models::user::UserId;
 use strum::Display;
 use tokio::sync::mpsc::error::SendError;
@@ -267,11 +267,12 @@ pub mod tests {
     use jsonwebtoken::EncodingKey;
     use rand::distributions::{Alphanumeric, DistString, Distribution, Uniform};
     use ring::signature::{self, Ed25519KeyPair, KeyPair};
-    use shuttle_common::backends::auth::ConvertResponse;
+    use shuttle_backends::auth::ConvertResponse;
+    use shuttle_backends::test_utils::gateway::PermissionsMock;
+    use shuttle_backends::test_utils::resource_recorder::get_mocked_resource_recorder;
     use shuttle_common::claims::{AccountTier, Claim};
     use shuttle_common::models::deployment::DeploymentRequest;
     use shuttle_common::models::{project, service};
-    use shuttle_proto::test_utils::resource_recorder::get_mocked_resource_recorder;
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{query, SqlitePool};
     use test_context::AsyncTestContext;
@@ -281,7 +282,7 @@ pub mod tests {
 
     use crate::acme::AcmeClient;
     use crate::api::latest::ApiBuilder;
-    use crate::args::{ContextArgs, StartArgs, UseTls};
+    use crate::args::{PermitArgs, ServiceArgs, StartArgs, UseTls};
     use crate::project::Project;
     use crate::proxy::UserServiceBuilder;
     use crate::service::{ContainerSettings, GatewayService, MIGRATIONS};
@@ -539,7 +540,7 @@ pub mod tests {
                 user,
                 bouncer,
                 use_tls: UseTls::Disable,
-                context: ContextArgs {
+                context: ServiceArgs {
                     docker_host,
                     image,
                     prefix,
@@ -574,6 +575,12 @@ pub mod tests {
                     // Allow access to the auth on the host
                     extra_hosts: vec!["host.docker.internal:host-gateway".to_string()],
                 },
+                permit: PermitArgs {
+                    permit_api_uri: Default::default(), // TODO: will need mock?
+                    permit_pdp_uri: Default::default(), // TODO: will need mock?
+                    permit_env: Default::default(),     // TODO: will need mock?
+                    permit_api_key: Default::default(), // TODO: will need mock?
+                },
             };
 
             let settings = ContainerSettings::builder().from_args(&args.context).await;
@@ -603,7 +610,7 @@ pub mod tests {
             }
         }
 
-        pub fn args(&self) -> ContextArgs {
+        pub fn args(&self) -> ServiceArgs {
             self.args.context.clone()
         }
 
@@ -649,9 +656,14 @@ pub mod tests {
         /// Create a service and sender to handle tasks. Also starts up a worker to create actual Docker containers for all requests
         pub async fn service(&self) -> (Arc<GatewayService>, Sender<BoxedTask>) {
             let service = Arc::new(
-                GatewayService::init(self.args(), self.pool(), "".into())
-                    .await
-                    .unwrap(),
+                GatewayService::init(
+                    self.args(),
+                    self.pool(),
+                    "".into(),
+                    Box::<PermissionsMock>::default(),
+                )
+                .await
+                .unwrap(),
             );
             let worker = Worker::new();
 
@@ -1151,9 +1163,14 @@ pub mod tests {
     async fn end_to_end() {
         let world = World::new().await;
         let service = Arc::new(
-            GatewayService::init(world.args(), world.pool(), "".into())
-                .await
-                .unwrap(),
+            GatewayService::init(
+                world.args(),
+                world.pool(),
+                "".into(),
+                Box::<PermissionsMock>::default(),
+            )
+            .await
+            .unwrap(),
         );
         let worker = Worker::new();
 
