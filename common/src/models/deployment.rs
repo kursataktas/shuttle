@@ -131,6 +131,7 @@ impl EcsState {
     /// we may end up with two different versions of Color.
     pub fn get_color(&self) -> &str {
         match self {
+            EcsState::Pending => "dark_yellow",
             EcsState::InProgress => "cyan",
             EcsState::Running => "green",
             EcsState::Stopped => "dark_blue",
