@@ -96,7 +96,13 @@ impl EcsResponse {
             None if EcsState::Running == self.latest_deployment_state
                 || EcsState::InProgress == self.latest_deployment_state =>
             {
-                format!("{latest_state} ({})", self.uri)
+                format!(
+                    "{latest_state} ({})",
+                    self.uri
+                        .as_ref()
+                        .map(|inner| format!("({inner})"))
+                        .unwrap_or("".to_string())
+                )
             }
             _ => latest_state,
         };
