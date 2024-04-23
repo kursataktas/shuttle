@@ -9,7 +9,9 @@ use reqwest::RequestBuilder;
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use shuttle_common::constants::headers::X_CARGO_SHUTTLE_VERSION;
+use shuttle_common::log::LogsRange;
 use shuttle_common::models::deployment::DeploymentRequest;
+use shuttle_common::models::organization;
 use shuttle_common::models::{deployment, project, service, ToJson};
 use shuttle_common::secrets::Secret;
 use shuttle_common::{resource, ApiKey, ApiUrl, LogItem, VersionInfo};
@@ -179,8 +181,27 @@ impl Client {
         self.delete(path).await
     }
 
-    pub async fn get_logs(&self, project: &str, deployment_id: &Uuid) -> Result<Vec<LogItem>> {
-        let path = format!("/projects/{project}/deployments/{deployment_id}/logs");
+    pub async fn get_organizations_list(&self) -> Result<Vec<organization::Response>> {
+        self.get("/organizations".to_string()).await
+    }
+
+    pub async fn get_organization_projects_list(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<project::Response>> {
+        let path = format!("/organizations/{org_id}/projects");
+
+        self.get(path).await
+    }
+
+    pub async fn get_logs(
+        &self,
+        project: &str,
+        deployment_id: &Uuid,
+        range: LogsRange,
+    ) -> Result<Vec<LogItem>> {
+        let mut path = format!("/projects/{project}/deployments/{deployment_id}/logs");
+        Self::add_range_query(range, &mut path);
 
         self.get(path)
             .await
@@ -191,10 +212,26 @@ impl Client {
         &self,
         project: &str,
         deployment_id: &Uuid,
+        range: LogsRange,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        let path = format!("/projects/{project}/ws/deployments/{deployment_id}/logs");
+        let mut path = format!("/projects/{project}/ws/deployments/{deployment_id}/logs");
+        Self::add_range_query(range, &mut path);
 
         self.ws_get(path).await
+    }
+
+    fn add_range_query(range: LogsRange, path: &mut String) {
+        match range {
+            LogsRange::Head(n) => {
+                path.push_str("?head=");
+                path.push_str(&n.to_string())
+            }
+            LogsRange::Tail(n) => {
+                path.push_str("?tail=");
+                path.push_str(&n.to_string())
+            }
+            _ => {}
+        };
     }
 
     pub async fn get_deployments(

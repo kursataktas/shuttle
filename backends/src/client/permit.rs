@@ -1,4 +1,7 @@
-use std::fmt::{Debug, Display};
+use std::{
+    fmt::{Debug, Display},
+    str::FromStr,
+};
 
 use async_trait::async_trait;
 use http::StatusCode;
@@ -8,7 +11,7 @@ use permit_client_rs::{
             create_relationship_tuple, delete_relationship_tuple, list_relationship_tuples,
         },
         resource_instances_api::{create_resource_instance, delete_resource_instance},
-        role_assignments_api::{assign_role, unassign_role},
+        role_assignments_api::{assign_role, list_role_assignments, unassign_role},
         users_api::{create_user, delete_user, get_user},
         Error as PermitClientError,
     },
@@ -26,10 +29,14 @@ use permit_pdp_client_rs::{
         policy_updater_api::trigger_policy_update_policy_updater_trigger_post,
         Error as PermitPDPClientError,
     },
-    models::{AuthorizationQuery, Resource, User, UserPermissionsQuery, UserPermissionsResult},
+    models::{AuthorizationQuery, Resource, User, UserPermissionsQuery},
 };
 use serde::{Deserialize, Serialize};
-use shuttle_common::{claims::AccountTier, models::organization};
+use shuttle_common::{
+    claims::AccountTier,
+    models::{error::ApiError, organization, project},
+};
+use tracing::error;
 
 #[async_trait]
 pub trait PermissionsDal {
@@ -53,6 +60,9 @@ pub trait PermissionsDal {
     /// Deletes a Project resource
     async fn delete_project(&self, project_id: &str) -> Result<()>;
 
+    /// Get list of all projects the user has direct permissions for
+    async fn get_personal_projects(&self, user_id: &str) -> Result<Vec<String>>;
+
     // Organization management
 
     /// Creates an Organization resource and assigns the user as admin for the organization
@@ -60,6 +70,10 @@ pub trait PermissionsDal {
 
     /// Deletes an Organization resource
     async fn delete_organization(&self, user_id: &str, org_id: &str) -> Result<()>;
+
+    /// Get the details of an organization
+    async fn get_organization(&self, user_id: &str, org_id: &str)
+        -> Result<organization::Response>;
 
     /// Get a list of all the organizations a user has access to
     async fn get_organizations(&self, user_id: &str) -> Result<Vec<organization::Response>>;
@@ -91,12 +105,36 @@ pub trait PermissionsDal {
         org_id: &str,
     ) -> Result<()>;
 
+    /// Add a user as a normal member to an organization
+    async fn add_organization_member(
+        &self,
+        admin_user: &str,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<()>;
+
+    /// Remove a user from an organization
+    async fn remove_organization_member(
+        &self,
+        admin_user: &str,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<()>;
+
+    /// Get a list of all the members of an organization
+    async fn get_organization_members(
+        &self,
+        user_id: &str,
+        org_id: &str,
+    ) -> Result<Vec<organization::MemberResponse>>;
+
     // Permissions queries
 
-    /// Get list of all projects user has permissions for
-    async fn get_user_projects(&self, user_id: &str) -> Result<Vec<UserPermissionsResult>>;
     /// Check if user can perform action on this project
     async fn allowed(&self, user_id: &str, project_id: &str, action: &str) -> Result<bool>;
+
+    /// Get the owner of a project
+    async fn get_project_owner(&self, user_id: &str, project_id: &str) -> Result<Owner>;
 }
 
 /// Simple details of an organization to create
@@ -119,6 +157,21 @@ impl OrganizationAttributes {
     fn new(org: &Organization) -> Self {
         Self {
             display_name: org.display_name.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Owner {
+    User(String),
+    Organization(String),
+}
+
+impl From<Owner> for project::Owner {
+    fn from(owner: Owner) -> Self {
+        match owner {
+            Owner::User(id) => project::Owner::User(id),
+            Owner::Organization(id) => project::Owner::Organization(id),
         }
     }
 }
@@ -250,24 +303,31 @@ impl PermissionsDal for Client {
         .await?)
     }
 
-    async fn get_user_projects(&self, user_id: &str) -> Result<Vec<UserPermissionsResult>> {
-        let perms = get_user_permissions_user_permissions_post(
-            &self.pdp,
-            UserPermissionsQuery {
-                user: Box::new(User {
-                    key: user_id.to_owned(),
-                    ..Default::default()
-                }),
-                resource_types: Some(vec!["Project".to_owned()]),
-                tenants: Some(vec!["default".to_owned()]),
-                ..Default::default()
-            },
+    async fn get_personal_projects(&self, user_id: &str) -> Result<Vec<String>> {
+        let projects = list_role_assignments(
+            &self.api,
+            &self.proj_id,
+            &self.env_id,
+            Some(user_id),
+            Some("admin"),
+            Some("default"),
+            Some("Project"),
+            None,
+            None,
             None,
             None,
         )
-        .await?;
+        .await?
+        .into_iter()
+        .map(|ra| ra.resource_instance.expect("to have resource instance"))
+        .map(|ri| {
+            ri.strip_prefix("Project:")
+                .expect("ID to start with the 'Project:' prefix")
+                .to_string()
+        })
+        .collect();
 
-        Ok(perms.into_values().collect())
+        Ok(projects)
     }
 
     async fn allowed(&self, user_id: &str, project_id: &str, action: &str) -> Result<bool> {
@@ -398,13 +458,58 @@ impl PermissionsDal for Client {
         )
         .await?;
 
-        let mut projects = Vec::with_capacity(relationships.len());
-
-        for rel in relationships {
-            projects.push(rel.object_details.expect("to have object details").key);
-        }
+        let projects = relationships
+            .into_iter()
+            .map(|rel| rel.object_details.expect("to have object details").key)
+            .collect();
 
         Ok(projects)
+    }
+
+    async fn get_organization(
+        &self,
+        user_id: &str,
+        org_id: &str,
+    ) -> Result<organization::Response> {
+        let mut perms = get_user_permissions_user_permissions_post(
+            &self.pdp,
+            UserPermissionsQuery {
+                user: Box::new(User {
+                    key: user_id.to_owned(),
+                    ..Default::default()
+                }),
+                resources: Some(vec![format!("Organization:{org_id}")]),
+                tenants: Some(vec!["default".to_owned()]),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await?;
+
+        let Some(org) = perms.remove(&format!("Organization:{org_id}")) else {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::FORBIDDEN,
+                content: "User does not have permission to view the organization".to_owned(),
+                entity: "Organization".to_owned(),
+            }));
+        };
+
+        let res = if let Some(resource) = org.resource {
+            let attributes = resource.attributes.unwrap_or_default();
+            let org_attrs = serde_json::from_value::<OrganizationAttributes>(attributes)
+                .expect("to read organization attributes");
+
+            organization::Response {
+                id: resource.key,
+                display_name: org_attrs.display_name,
+                is_admin: org.roles.unwrap_or_default().contains(&"admin".to_string()),
+            }
+        } else {
+            unreachable!("the permission will always have a resource")
+        };
+
+        Ok(res)
     }
 
     async fn get_organizations(&self, user_id: &str) -> Result<Vec<organization::Response>> {
@@ -514,60 +619,145 @@ impl PermissionsDal for Client {
 
         Ok(())
     }
+
+    async fn add_organization_member(
+        &self,
+        admin_user: &str,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        if !self.allowed_org(admin_user, org_id, "manage").await? {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::FORBIDDEN,
+                content: "User does not have permission to modify the organization".to_owned(),
+                entity: "Organization".to_owned(),
+            }));
+        }
+
+        let user = self.get_user(user_id).await?;
+
+        if !user
+            .roles
+            .is_some_and(|roles| roles.iter().any(|r| r.role == AccountTier::Pro.to_string()))
+        {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::BAD_REQUEST,
+                content: "Only Pro users can be added to an organization".to_owned(),
+                entity: "Organization".to_owned(),
+            }));
+        }
+
+        self.assign_resource_role(user_id, format!("Organization:{org_id}"), "member")
+            .await?;
+
+        Ok(())
+    }
+
+    async fn remove_organization_member(
+        &self,
+        admin_user: &str,
+        org_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        if admin_user == user_id {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::BAD_REQUEST,
+                content: "Cannot remove yourself from an organization".to_owned(),
+                entity: "Organization".to_owned(),
+            }));
+        }
+
+        if !self.allowed_org(admin_user, org_id, "manage").await? {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::FORBIDDEN,
+                content: "User does not have permission to modify the organization".to_owned(),
+                entity: "Organization".to_owned(),
+            }));
+        }
+
+        self.unassign_resource_role(user_id, format!("Organization:{org_id}"), "member")
+            .await?;
+
+        Ok(())
+    }
+
+    async fn get_organization_members(
+        &self,
+        user_id: &str,
+        org_id: &str,
+    ) -> Result<Vec<organization::MemberResponse>> {
+        if !self.allowed_org(user_id, org_id, "view").await? {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::FORBIDDEN,
+                content: "User does not have permission to view the organization".to_owned(),
+                entity: "Organization".to_owned(),
+            }));
+        }
+
+        let assignments = list_role_assignments(
+            &self.api,
+            &self.proj_id,
+            &self.env_id,
+            None,
+            None,
+            Some("default"),
+            None,
+            Some(&format!("Organization:{org_id}")),
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+        let members = assignments
+            .into_iter()
+            .map(|assignment| organization::MemberResponse {
+                id: assignment.user,
+                role: organization::MemberRole::from_str(&assignment.role)
+                    .unwrap_or(organization::MemberRole::Member),
+            })
+            .collect();
+
+        Ok(members)
+    }
+
+    async fn get_project_owner(&self, user_id: &str, project_id: &str) -> Result<Owner> {
+        if !self.allowed(user_id, project_id, "view").await? {
+            return Err(Error::ResponseError(ResponseContent {
+                status: StatusCode::FORBIDDEN,
+                content: "User does not have permission to view the project".to_owned(),
+                entity: "Project".to_owned(),
+            }));
+        }
+
+        let relationships = list_relationship_tuples(
+            &self.api,
+            &self.proj_id,
+            &self.env_id,
+            Some(true),
+            None,
+            None,
+            Some("default"),
+            None,
+            Some("parent"),
+            Some(&format!("Project:{project_id}")),
+            None,
+            Some("Organization"),
+        )
+        .await?;
+
+        if let Some(rel) = relationships.into_iter().next() {
+            let org_id = rel.subject_details.expect("to have subject details").key;
+            Ok(Owner::Organization(org_id))
+        } else {
+            // If a user is able to view a project while the project has no parent org, then this user must be the project owner
+            Ok(Owner::User(user_id.to_owned()))
+        }
+    }
 }
 
 // Helpers for trait methods
 impl Client {
-    // pub async fn get_organization_members(&self, org_name: &str) -> Result<Vec<Value>> {
-    //     self.api
-    //         .get(
-    //             &format!(
-    //                 "{}/role_assignments?resource_instance=Organization:{org_name}&role=member",
-    //                 self.facts
-    //             ),
-    //             None,
-    //         )
-    //         .await
-    // }
-
-    // pub async fn create_organization_member(
-    //     &self,
-    //     org_name: &str,
-    //     user_id: &str,
-    // ) -> Result<()> {
-    //     self.api
-    //         .post(
-    //             &format!("{}/role_assignments", self.facts),
-    //             json!({
-    //                 "role": "member",
-    //                 "resource_instance": format!("Organization:{org_name}"),
-    //                 "tenant": "default",
-    //                 "user": user_id,
-    //             }),
-    //             None,
-    //         )
-    //         .await
-    // }
-
-    // pub async fn delete_organization_member(
-    //     &self,
-    //     org_name: &str,
-    //     user_id: &str,
-    // ) -> Result<()> {
-    //     self.api
-    //         .delete(
-    //             &format!("{}/role_assignments", self.facts),
-    //             json!({
-    //                 "role": "member",
-    //                 "resource_instance": format!("Organization:{org_name}"),
-    //                 "tenant": "default",
-    //                 "user": user_id,
-    //             }),
-    //             None,
-    //         )
-    //         .await
-    // }
-
     async fn create_user(&self, user_id: &str) -> Result<UserRead> {
         Ok(create_user(
             &self.api,
@@ -837,6 +1027,26 @@ impl<T: Debug> From<PermitPDPClientError<T>> for Error {
                 content: e.content,
                 entity: format!("{:?}", e.entity),
             }),
+        }
+    }
+}
+impl From<Error> for ApiError {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::ResponseError(value) => ApiError {
+                message: value.content.to_string(),
+                status_code: value.status.into(),
+            },
+            err => {
+                error!(
+                    error = &err as &dyn std::error::Error,
+                    "Internal error while talking to service"
+                );
+                ApiError {
+                    message: "Our server was unable to handle your request. A ticket should be created for us to fix this.".to_string(),
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR.into(),
+                }
+            }
         }
     }
 }

@@ -211,11 +211,11 @@ pub enum ProjectCommand {
     /// List all projects belonging to the calling account
     List {
         #[arg(long, default_value = "1")]
-        /// Which page to display
+        /// (deprecated) Which page to display
         page: u32,
 
-        #[arg(long, default_value = "10")]
-        /// How many projects per page to display
+        #[arg(long, default_value = "15")]
+        /// (deprecated) How many projects per page to display
         limit: u32,
 
         #[arg(long, default_value_t = false)]
@@ -417,6 +417,15 @@ pub struct LogsArgs {
     /// Don't display timestamps and log origin tags
     #[arg(long)]
     pub raw: bool,
+    /// View the first N log lines
+    #[arg(long, group = "output_mode")]
+    pub head: Option<u32>,
+    /// View the last N log lines
+    #[arg(long, group = "output_mode")]
+    pub tail: Option<u32>,
+    /// View all log lines
+    #[arg(long, group = "output_mode")]
+    pub all: bool,
 }
 
 /// Helper function to parse and return the absolute path
