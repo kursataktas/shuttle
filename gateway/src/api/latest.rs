@@ -21,18 +21,18 @@ use serde::{Deserialize, Serialize};
 use shuttle_backends::auth::{AuthPublicKey, JwtAuthenticationLayer, ScopedLayer};
 use shuttle_backends::axum::CustomErrorPath;
 use shuttle_backends::cache::CacheManager;
-use shuttle_backends::client::permit::Organization;
+use shuttle_backends::client::permit::Team;
 use shuttle_backends::metrics::{Metrics, TraceLayer};
 use shuttle_backends::project_name::ProjectName;
 use shuttle_backends::request_span;
 use shuttle_backends::ClaimExt;
 use shuttle_common::claims::{Claim, Scope, EXP_MINUTES};
 use shuttle_common::models::error::{
-    ApiError, InvalidCustomDomain, InvalidOrganizationName, ProjectCorrupted,
-    ProjectHasBuildingDeployment, ProjectHasResources, ProjectHasRunningDeployment,
+    ApiError, InvalidCustomDomain, InvalidTeamName, ProjectCorrupted, ProjectHasBuildingDeployment,
+    ProjectHasResources, ProjectHasRunningDeployment,
 };
 use shuttle_common::models::{admin::ProjectResponse, project, stats};
-use shuttle_common::models::{organization, service};
+use shuttle_common::models::{service, team};
 use shuttle_common::{deployment, VersionInfo};
 use shuttle_proto::provisioner::provisioner_client::ProvisionerClient;
 use shuttle_proto::provisioner::Ping;
@@ -40,7 +40,7 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{Mutex, MutexGuard};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
-use tracing::{error, field, instrument, trace, Span};
+use tracing::{debug, error, field, info, instrument, trace, warn, Span};
 use ttl_cache::TtlCache;
 use ulid::Ulid;
 use uuid::Uuid;
@@ -309,49 +309,30 @@ async fn delete_project(
 
     let project_id = Ulid::from_string(&project.id).expect("stored project id to be a valid ULID");
 
-    // Try to startup destroyed, errored or outdated projects
-    let project_deletable = project.state.is_ready() || project.state.is_stopped();
-    let current_version: semver::Version = env!("CARGO_PKG_VERSION")
-        .parse()
-        .expect("to have a valid semver gateway version");
-
-    let version = project
-        .state
-        .container()
-        .and_then(|container_inspect_response| {
-            container_inspect_response.image.and_then(|inner| {
-                inner
-                    .strip_prefix("public.ecr.aws/shuttle/deployer:v")
-                    .and_then(|x| x.parse::<semver::Version>().ok())
-            })
-        })
-        // Defaulting to a version that introduced a breaking change.
-        // This was the last one that introduced it at the present
-        // moment.
-        .unwrap_or(semver::Version::new(0, 39, 0));
-
     // We restart the project before deletion everytime
-    // we detect it is outdated, so that we avoid by default
-    // breaking changes that can happen on the deployer
-    // side in the future.
-    if !project_deletable || version < current_version {
-        let handle = state
-            .service
-            .new_task()
-            .project(project_name.clone())
-            .and_then(task::restart(project_id))
-            .and_then(task::run_until_done())
-            .send(&state.sender)
-            .await?;
+    let handle = state
+        .service
+        .new_task()
+        .project(project_name.clone())
+        .and_then(task::destroy()) // This destroy might only recover the project from an errored state
+        .and_then(task::run_until_destroyed())
+        .and_then(task::restart(project_id))
+        .and_then(task::run_until_ready())
+        .and_then(task::destroy())
+        .and_then(task::run_until_destroyed())
+        .and_then(task::restart(project_id))
+        .and_then(task::run_until_ready())
+        .send(&state.sender)
+        .await?;
 
-        // Wait for the project to be ready
-        handle.await;
+    // Wait for the project to be ready
+    handle.await;
 
-        let new_state = state.service.find_project_by_name(&project_name).await?;
+    let new_state = state.service.find_project_by_name(&project_name).await?;
 
-        if !new_state.state.is_ready() {
-            return Err(ProjectCorrupted.into());
-        }
+    if !new_state.state.is_ready() {
+        warn!(state = ?new_state.state, "failed to restart project");
+        return Err(ProjectCorrupted.into());
     }
 
     let service = state.service.clone();
@@ -360,8 +341,10 @@ async fn delete_project(
     let project_caller =
         ProjectCaller::new(state.clone(), scoped_user.clone(), req.headers()).await?;
 
+    trace!("getting deployments");
     // check that a deployment is not running
     let mut deployments = project_caller.get_deployment_list().await?;
+    debug!(?deployments, "got deployments");
     deployments.sort_by_key(|d| d.last_update);
 
     // Make sure no deployment is in the building pipeline
@@ -376,6 +359,7 @@ async fn delete_project(
     });
 
     if has_bad_state {
+        warn!("has bad state");
         return Err(ProjectHasBuildingDeployment.into());
     }
 
@@ -384,6 +368,7 @@ async fn delete_project(
         .filter(|d| d.state == deployment::State::Running);
 
     for running_deployment in running_deployments {
+        info!(%running_deployment, "stopping running deployment");
         let res = project_caller
             .stop_deployment(&running_deployment.id)
             .await?;
@@ -393,11 +378,13 @@ async fn delete_project(
         }
     }
 
+    trace!("getting resources");
     // check if any resources exist
     let resources = project_caller.get_resources().await?;
     let mut delete_fails = Vec::new();
 
     for resource in resources {
+        info!(?resource, "deleting resource");
         let resource_type = resource.r#type.to_string();
         let res = project_caller.delete_resource(&resource_type).await?;
 
@@ -410,6 +397,7 @@ async fn delete_project(
         return Err(ProjectHasResources(delete_fails).into());
     }
 
+    trace!("deleting container");
     let task = service
         .new_task()
         .project(project_name.clone())
@@ -418,6 +406,7 @@ async fn delete_project(
         .await?;
     task.await;
 
+    trace!("removing project from state");
     service.delete_project(&project_name).await?;
 
     Ok(AxumJson("project successfully deleted".to_owned()))
@@ -510,63 +499,61 @@ async fn route_project(
 }
 
 #[instrument(skip_all)]
-async fn get_organizations(
+async fn get_teams(
     State(RouterState { service, .. }): State<RouterState>,
     Claim { sub, .. }: Claim,
-) -> Result<AxumJson<Vec<organization::Response>>, ApiError> {
-    let orgs = service.permit_client.get_organizations(&sub).await?;
+) -> Result<AxumJson<Vec<team::Response>>, ApiError> {
+    let teams = service.permit_client.get_teams(&sub).await?;
 
-    Ok(AxumJson(orgs))
+    Ok(AxumJson(teams))
 }
 
 #[instrument(skip_all)]
-async fn get_organization(
+async fn get_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath(organization_id): CustomErrorPath<String>,
+    CustomErrorPath(team_id): CustomErrorPath<String>,
     Claim { sub, .. }: Claim,
-) -> Result<AxumJson<organization::Response>, ApiError> {
-    let org = service
-        .permit_client
-        .get_organization(&sub, &organization_id)
-        .await?;
+) -> Result<AxumJson<team::Response>, ApiError> {
+    let team = service.permit_client.get_team(&sub, &team_id).await?;
 
-    Ok(AxumJson(org))
+    Ok(AxumJson(team))
 }
 
-#[instrument(skip_all, fields(shuttle.organization.name = %organization_name, shuttle.organization.id = field::Empty))]
-async fn create_organization(
+#[instrument(skip_all, fields(shuttle.team.name = %team_name, shuttle.team.id = field::Empty))]
+async fn create_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath(organization_name): CustomErrorPath<String>,
+    CustomErrorPath(team_name): CustomErrorPath<String>,
     Claim { sub, .. }: Claim,
-) -> Result<String, ApiError> {
-    if organization_name.chars().count() > 30 {
-        return Err(InvalidOrganizationName.into());
+) -> Result<AxumJson<team::Response>, ApiError> {
+    if team_name.chars().count() > 30 {
+        return Err(InvalidTeamName.into());
     }
 
-    let org = Organization {
-        id: format!("org_{}", Ulid::new()),
-        display_name: organization_name.clone(),
+    let team = Team {
+        id: format!("team_{}", Ulid::new()),
+        display_name: team_name.clone(),
     };
 
-    service
-        .permit_client
-        .create_organization(&sub, &org)
-        .await?;
+    service.permit_client.create_team(&sub, &team).await?;
 
-    Span::current().record("shuttle.organization.id", &org.id);
+    Span::current().record("shuttle.team.id", &team.id);
 
-    Ok("Organization created".to_string())
+    Ok(AxumJson(team::Response {
+        id: team.id,
+        display_name: team.display_name,
+        is_admin: true,
+    }))
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id))]
-async fn get_organization_projects(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id))]
+async fn get_team_projects(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath(organization_id): CustomErrorPath<String>,
+    CustomErrorPath(team_id): CustomErrorPath<String>,
     Claim { sub, .. }: Claim,
 ) -> Result<AxumJson<Vec<project::Response>>, ApiError> {
     let project_ids = service
         .permit_client
-        .get_organization_projects(&sub, &organization_id)
+        .get_team_projects(&sub, &team_id)
         .await?;
 
     let mut projects = Vec::with_capacity(project_ids.len());
@@ -597,85 +584,82 @@ async fn get_organization_projects(
     Ok(AxumJson(projects))
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id))]
-async fn delete_organization(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id))]
+async fn delete_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath(organization_id): CustomErrorPath<String>,
+    CustomErrorPath(team_id): CustomErrorPath<String>,
     Claim { sub, .. }: Claim,
 ) -> Result<String, ApiError> {
-    service
-        .permit_client
-        .delete_organization(&sub, &organization_id)
-        .await?;
+    service.permit_client.delete_team(&sub, &team_id).await?;
 
-    Ok("Organization deleted".to_string())
+    Ok("Team deleted".to_string())
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id, shuttle.project.id = %project_id))]
-async fn transfer_project_to_organization(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id, shuttle.project.id = %project_id))]
+async fn transfer_project_to_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath((organization_id, project_id)): CustomErrorPath<(String, String)>,
+    CustomErrorPath((team_id, project_id)): CustomErrorPath<(String, String)>,
     Claim { sub, .. }: Claim,
 ) -> Result<String, ApiError> {
     service
         .permit_client
-        .transfer_project_to_org(&sub, &project_id, &organization_id)
+        .transfer_project_to_team(&sub, &project_id, &team_id)
         .await?;
 
     Ok("Project transfered".to_string())
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id, shuttle.project.id = %project_id))]
-async fn transfer_project_from_organization(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id, shuttle.project.id = %project_id))]
+async fn transfer_project_from_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath((organization_id, project_id)): CustomErrorPath<(String, String)>,
+    CustomErrorPath((team_id, project_id)): CustomErrorPath<(String, String)>,
     Claim { sub, .. }: Claim,
 ) -> Result<String, ApiError> {
     service
         .permit_client
-        .transfer_project_from_org(&sub, &project_id, &organization_id)
+        .transfer_project_from_team(&sub, &project_id, &team_id)
         .await?;
 
     Ok("Project transfered".to_string())
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id))]
-async fn get_organization_members(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id))]
+async fn get_team_members(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath(organization_id): CustomErrorPath<String>,
+    CustomErrorPath(team_id): CustomErrorPath<String>,
     Claim { sub, .. }: Claim,
-) -> Result<AxumJson<Vec<organization::MemberResponse>>, ApiError> {
+) -> Result<AxumJson<Vec<team::MemberResponse>>, ApiError> {
     let members = service
         .permit_client
-        .get_organization_members(&sub, &organization_id)
+        .get_team_members(&sub, &team_id)
         .await?;
 
     Ok(AxumJson(members))
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id))]
-async fn add_member_to_organization(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id))]
+async fn add_member_to_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath((organization_id, user_id)): CustomErrorPath<(String, String)>,
+    CustomErrorPath((team_id, user_id)): CustomErrorPath<(String, String)>,
     Claim { sub, .. }: Claim,
 ) -> Result<String, ApiError> {
     service
         .permit_client
-        .add_organization_member(&sub, &organization_id, &user_id)
+        .add_team_member(&sub, &team_id, &user_id)
         .await?;
 
     Ok("Member added".to_string())
 }
 
-#[instrument(skip_all, fields(shuttle.organization.id = %organization_id))]
-async fn remove_member_from_organization(
+#[instrument(skip_all, fields(shuttle.team.id = %team_id))]
+async fn remove_member_from_team(
     State(RouterState { service, .. }): State<RouterState>,
-    CustomErrorPath((organization_id, user_id)): CustomErrorPath<(String, String)>,
+    CustomErrorPath((team_id, user_id)): CustomErrorPath<(String, String)>,
     Claim { sub, .. }: Claim,
 ) -> Result<String, ApiError> {
     service
         .permit_client
-        .remove_organization_member(&sub, &organization_id, &user_id)
+        .remove_team_member(&sub, &team_id, &user_id)
         .await?;
 
     Ok("Member removed".to_string())
@@ -697,7 +681,7 @@ async fn get_status(
     };
 
     // Compute provisioner status.
-    let provisioner_status = if let Ok(channel) = service.provisioner_host().connect().await {
+    let provisioner_status = if let Ok(channel) = service.provisioner_uri().connect().await {
         let channel = ServiceBuilder::new().service(channel);
         let mut provisioner_client = ProvisionerClient::new(channel);
         if provisioner_client.health_check(Ping {}).await.is_ok() {
@@ -1145,29 +1129,26 @@ impl ApiBuilder {
             .route("/projects/:project_name/*any", any(route_project))
             .route_layer(middleware::from_fn(project_name_tracing_layer));
 
-        let organization_routes = Router::new()
-            .route("/", get(get_organizations))
-            .route("/name/:organization_name", post(create_organization))
+        let team_routes = Router::new()
+            .route("/", get(get_teams))
+            .route("/name/:team_name", post(create_team))
+            .route("/:team_id", get(get_team).delete(delete_team))
+            .route("/:team_id/projects", get(get_team_projects))
             .route(
-                "/:organization_id",
-                get(get_organization).delete(delete_organization),
+                "/:team_id/projects/:project_id",
+                post(transfer_project_to_team).delete(transfer_project_from_team),
             )
-            .route("/:organization_id/projects", get(get_organization_projects))
+            .route("/:team_id/members", get(get_team_members))
             .route(
-                "/:organization_id/projects/:project_id",
-                post(transfer_project_to_organization).delete(transfer_project_from_organization),
-            )
-            .route("/:organization_id/members", get(get_organization_members))
-            .route(
-                "/:organization_id/members/:user_id",
-                post(add_member_to_organization).delete(remove_member_from_organization),
+                "/:team_id/members/:user_id",
+                post(add_member_to_team).delete(remove_member_from_team),
             );
 
         self.router = self
             .router
             .route("/", get(get_status))
             .merge(project_routes)
-            .nest("/organizations", organization_routes)
+            .nest("/teams", team_routes)
             .route(
                 "/versions",
                 get(|| async {
@@ -1750,20 +1731,6 @@ pub mod tests {
 
     #[test_context(TestProject)]
     #[tokio::test]
-    async fn api_delete_project_that_has_resources_but_fails_to_remove_them(
-        project: &mut TestProject,
-    ) {
-        project.deploy("../examples/axum/metadata").await;
-        project.stop_service().await;
-
-        assert_eq!(
-            project.router_call(Method::DELETE, "/delete").await,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test_context(TestProject)]
-    #[tokio::test]
     async fn api_delete_project_that_has_running_deployment(project: &mut TestProject) {
         project.deploy("../examples/axum/hello-world").await;
 
@@ -1779,11 +1746,11 @@ pub mod tests {
         project.just_deploy("../examples/axum/hello-world").await;
 
         // Wait a bit to it to progress in the queue
-        sleep(Duration::from_secs(2)).await;
+        sleep(Duration::from_secs(10)).await;
 
         assert_eq!(
             project.router_call(Method::DELETE, "/delete").await,
-            StatusCode::BAD_REQUEST
+            StatusCode::OK
         );
     }
 
