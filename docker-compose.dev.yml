@@ -88,7 +88,7 @@ services:
       - "--provisioner-uri=http://provisioner:8000"
       - "--proxy-fqdn=${APPS_FQDN}"
       - "--use-tls=${USE_TLS}"
-      - "--cors-origin=http://localhost:3001"
+      - "--cors-origin=${CORS_ORIGIN}"
       - "--admin-key=${GATEWAY_ADMIN_KEY}"
       - "--permit-api-uri=https://api.eu-central-1.permit.io"
       - "--permit-pdp-uri=http://permit-pdp:7000"
@@ -98,6 +98,7 @@ services:
     ports:
       - 4317:4317
       - 4318:4318
+    restart: no # don't cycle restarts due to missing keys
   logger:
     ports:
       - 8010:8000

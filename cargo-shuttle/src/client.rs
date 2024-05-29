@@ -8,7 +8,7 @@ use reqwest::header::HeaderMap;
 use reqwest::{RequestBuilder, Response};
 use serde::{Deserialize, Serialize};
 use shuttle_common::constants::headers::X_CARGO_SHUTTLE_VERSION;
-use shuttle_common::log::LogsRange;
+use shuttle_common::log::{LogsRange, LogsResponseBeta};
 use shuttle_common::models::deployment::{DeploymentRequest, DeploymentRequestBeta};
 use shuttle_common::models::team;
 use shuttle_common::models::{deployment, project, service, ToJson};
@@ -109,17 +109,16 @@ impl ShuttleApiClient {
         &self,
         project: &str,
         deployment_req: DeploymentRequestBeta,
-    ) -> Result<deployment::EcsResponse> {
-        let path = format!("/projects/{project}");
+    ) -> Result<deployment::ResponseBeta> {
+        let path = format!("/projects/{project}/deployments");
         let deployment_req = rmp_serde::to_vec(&deployment_req)
             .context("serialize DeploymentRequest as a MessagePack byte vector")?;
 
         let url = format!("{}{}", self.api_url, path);
-        let mut builder = self.client.put(url);
+        let mut builder = self.client.post(url);
         builder = self.set_auth_bearer(builder);
 
         builder
-            .header("Transfer-Encoding", "chunked")
             .body(deployment_req)
             .send()
             .await
@@ -216,7 +215,7 @@ impl ShuttleApiClient {
     pub async fn get_projects_list(&self) -> Result<Vec<project::Response>> {
         self.get("/projects".to_owned()).await
     }
-    pub async fn get_projects_list_beta(&self) -> Result<Vec<project::ResponseBeta>> {
+    pub async fn get_projects_list_beta(&self) -> Result<project::ResponseListBeta> {
         self.get("/projects".to_owned()).await
     }
 
@@ -240,11 +239,17 @@ impl ShuttleApiClient {
     pub async fn get_team_projects_list(&self, team_id: &str) -> Result<Vec<project::Response>> {
         self.get(format!("/teams/{team_id}/projects")).await
     }
+    pub async fn get_team_projects_list_beta(
+        &self,
+        team_id: &str,
+    ) -> Result<project::ResponseListBeta> {
+        self.get(format!("/teams/{team_id}/projects")).await
+    }
 
     pub async fn get_logs(
         &self,
         project: &str,
-        deployment_id: &Uuid,
+        deployment_id: &str,
         range: LogsRange,
     ) -> Result<Vec<LogItem>> {
         let mut path = format!("/projects/{project}/deployments/{deployment_id}/logs");
@@ -254,11 +259,25 @@ impl ShuttleApiClient {
             .await
             .context("Failed parsing logs. Is your cargo-shuttle outdated?")
     }
+    pub async fn get_deployment_logs_beta(
+        &self,
+        project: &str,
+        deployment_id: &str,
+    ) -> Result<LogsResponseBeta> {
+        let path = format!("/projects/{project}/deployments/{deployment_id}/logs");
+
+        self.get(path).await.context("Failed parsing logs.")
+    }
+    pub async fn get_project_logs_beta(&self, project: &str) -> Result<LogsResponseBeta> {
+        let path = format!("/projects/{project}/logs");
+
+        self.get(path).await.context("Failed parsing logs.")
+    }
 
     pub async fn get_logs_ws(
         &self,
         project: &str,
-        deployment_id: &Uuid,
+        deployment_id: &str,
         range: LogsRange,
     ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         let mut path = format!("/projects/{project}/ws/deployments/{deployment_id}/logs");
@@ -281,12 +300,6 @@ impl ShuttleApiClient {
         };
     }
 
-    pub async fn deployments_beta(&self, project: &str) -> Result<Vec<deployment::EcsResponse>> {
-        let path = format!("/projects/{project}/deployments",);
-
-        self.get(path).await
-    }
-
     pub async fn get_deployments(
         &self,
         project: &str,
@@ -301,12 +314,28 @@ impl ShuttleApiClient {
 
         self.get(path).await
     }
+    pub async fn get_deployments_beta(
+        &self,
+        project: &str,
+    ) -> Result<Vec<deployment::ResponseBeta>> {
+        let path = format!("/projects/{project}/deployments");
 
-    pub async fn deployment_status(
+        self.get(path).await
+    }
+    pub async fn get_current_deployment_beta(
+        &self,
+        project: &str,
+    ) -> Result<deployment::ResponseBeta> {
+        let path = format!("/projects/{project}/deployments/current");
+
+        self.get(path).await
+    }
+
+    pub async fn get_deployment_beta(
         &self,
         project: &str,
         deployment_id: &str,
-    ) -> Result<deployment::EcsResponse> {
+    ) -> Result<deployment::ResponseBeta> {
         let path = format!("/projects/{project}/deployments/{deployment_id}");
 
         self.get(path).await
