@@ -30,6 +30,7 @@ pub enum Backend {
     ResourceRecorder,
     Control,
     Runtime(String),
+    Runner,
 }
 
 /// Which subset of deployment log lines to process
