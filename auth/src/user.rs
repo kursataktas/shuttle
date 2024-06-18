@@ -453,7 +453,14 @@ where
             .get_user_by_key(key.into())
             .await
             // Absorb any error into `Unauthorized`
-            .map_err(|_| Error::Unauthorized)?;
+            .map_err(|err| {
+                tracing::info!(
+                    error = &err as &dyn std::error::Error,
+                    "failed to get user by key"
+                );
+
+                Error::Unauthorized
+            })?;
 
         // Record current account name for tracing purposes
         Span::current().record("account.user_id", &user.id);
