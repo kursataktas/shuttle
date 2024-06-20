@@ -349,6 +349,7 @@ async fn delete_project(
 
     // Make sure no deployment is in the building pipeline
     let has_bad_state = deployments.iter().any(|d| {
+        tracing::info!("state of deployment: {}, id: {}", d.state, d.id);
         !matches!(
             d.state,
             deployment::State::Running
