@@ -1240,7 +1240,9 @@ impl ApiBuilder {
     pub fn serve(self) -> impl Future<Output = Result<(), hyper::Error>> {
         let bind = self.bind.expect("a socket address to bind to is required");
         let router = self.into_router();
-        axum::Server::bind(&bind).serve(router.into_make_service())
+        axum::Server::bind(&bind)
+            .http2_keep_alive_interval(Duration::from_secs(60))
+            .serve(router.into_make_service())
     }
 }
 
