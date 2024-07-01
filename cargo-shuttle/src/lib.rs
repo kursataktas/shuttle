@@ -33,7 +33,7 @@ use ignore::WalkBuilder;
 use indicatif::ProgressBar;
 use indoc::{formatdoc, printdoc};
 use shuttle_common::models::deployment::{
-    BuildMetaBeta, DeploymentRequestBuildArchiveBeta, DeploymentRequestImageBeta,
+    BuildArgsBeta, BuildMetaBeta, DeploymentRequestBuildArchiveBeta, DeploymentRequestImageBeta,
 };
 use shuttle_common::{
     constants::{
@@ -1055,7 +1055,14 @@ impl Shuttle {
             client.get_service_resources(self.ctx.project_name()).await
         }
         .map_err(suggestions::resources::get_service_resources_failure)?;
-        let table = get_resource_tables(&resources, self.ctx.project_name(), raw, show_secrets);
+
+        let table = get_resource_tables(
+            &resources,
+            self.ctx.project_name(),
+            raw,
+            show_secrets,
+            self.beta,
+        );
 
         println!("{table}");
 
@@ -1261,7 +1268,15 @@ impl Shuttle {
 
         println!(
             "{}",
-            get_resource_tables(&mocked_responses, service_name.as_str(), false, false)
+            get_resource_tables(
+                &mocked_responses,
+                service_name.as_str(),
+                false,
+                false,
+                // Set beta to false to avoid breaking local run with beta changes.
+                // TODO: make local run compatible with --beta.
+                false
+            )
         );
 
         //
@@ -1372,6 +1387,7 @@ impl Shuttle {
                     *bytes = serde_json::to_vec(&ShuttleResourceOutput {
                         output: res,
                         custom: shuttle_resource.custom,
+                        state: None
                     })
                     .unwrap();
                 }
@@ -1385,6 +1401,7 @@ impl Shuttle {
                     *bytes = serde_json::to_vec(&ShuttleResourceOutput {
                         output: secrets.clone(),
                         custom: shuttle_resource.custom,
+                        state: None
                     })
                     .unwrap();
                 }
@@ -1403,6 +1420,7 @@ impl Shuttle {
                     *bytes = serde_json::to_vec(&ShuttleResourceOutput {
                         output: res,
                         custom: shuttle_resource.custom,
+                        state: None
                     })
                     .unwrap();
                 }
@@ -1818,6 +1836,8 @@ impl Shuttle {
         };
 
         if self.beta {
+            let mut build_args = BuildArgsBeta::default();
+
             let metadata = async_cargo_metadata(manifest_path.as_path()).await?;
             let packages = find_shuttle_packages(&metadata)?;
             // TODO: support overriding this
@@ -1825,16 +1845,22 @@ impl Shuttle {
                 .first()
                 .expect("at least one shuttle crate in the workspace");
             let package_name = package.name.to_owned();
-            deployment_req_buildarch_beta.package_name = package_name;
+            build_args.package_name = Some(package_name);
 
-            // TODO: add these to the request and builder
-            let (_no_default_features, _features) = if package.features.contains_key("shuttle") {
-                (true, vec!["shuttle".to_owned()])
+            // activate shuttle feature is present
+            let (no_default_features, features) = if package.features.contains_key("shuttle") {
+                (true, Some(vec!["shuttle".to_owned()]))
             } else {
-                (false, vec![])
+                (false, None)
             };
+            build_args.no_default_features = no_default_features;
+            build_args.features = features.map(|v| v.join(","));
+
             // TODO: determine which (one) binary to build
-            // TODO: have the above be configurable in CLI and Shuttle.toml
+
+            deployment_req_buildarch_beta.build_args = Some(build_args);
+
+            // TODO: have all of the above be configurable in CLI and Shuttle.toml
         }
 
         if let Ok(repo) = Repository::discover(working_directory) {
@@ -2099,7 +2125,8 @@ impl Shuttle {
         let resources = client
             .get_service_resources(self.ctx.project_name())
             .await?;
-        let resources = get_resource_tables(&resources, self.ctx.project_name(), false, false);
+        let resources =
+            get_resource_tables(&resources, self.ctx.project_name(), false, false, self.beta);
 
         println!("{resources}{service}");
 
