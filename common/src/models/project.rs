@@ -1,5 +1,6 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
+use std::fmt::Write;
 use std::str::FromStr;
 
 use comfy_table::{
@@ -35,6 +36,31 @@ pub struct ResponseBeta {
     pub owner: Owner,
     /// Whether the calling user is an admin in this project
     pub is_admin: bool,
+}
+
+impl ResponseBeta {
+    pub fn to_string_colored(&self) -> String {
+        // TODO: make this look nicer
+        let mut s = String::new();
+        writeln!(&mut s, "Project Name: {}", self.name.as_str().bold()).unwrap();
+        writeln!(&mut s, "Project Id: {}", self.id.as_str().bold()).unwrap();
+        writeln!(
+            &mut s,
+            "Deployment state: {}",
+            self.deployment_state
+                .as_ref()
+                .map(|s| s.to_string_colored())
+                .unwrap_or_else(|| "N/A".dark_grey().to_string())
+        )
+        .unwrap();
+        let owner = match self.owner {
+            Owner::User(ref s) => s,
+            Owner::Team(ref s) => s,
+        };
+        writeln!(&mut s, "Owner: {}", owner.as_str().bold()).unwrap();
+
+        s
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]

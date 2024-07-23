@@ -58,20 +58,20 @@ impl Display for Response {
 }
 
 impl ResponseBeta {
-    pub fn colored_println(&self) {
-        let state = format!(
-            "{}",
-            self.state
-                .to_string()
-                // Unwrap is safe because Color::from_str returns the color white if the argument is not a Color.
-                .with(crossterm::style::Color::from_str(self.state.get_color()).unwrap())
-        );
-
+    pub fn to_string_summary_colored(&self) -> String {
         // TODO: make this look nicer
-        println!(
+        format!(
+            "Deployment {} - {}",
+            self.id.as_str().bold(),
+            self.state.to_string_colored(),
+        )
+    }
+    pub fn to_string_colored(&self) -> String {
+        // TODO: make this look nicer
+        format!(
             "Deployment {} - {}\n{}",
             self.id.as_str().bold(),
-            state,
+            self.state.to_string_colored(),
             self.uris.join("\n"),
         )
     }
@@ -88,24 +88,6 @@ impl State {
             State::Completed | State::Stopped => "blue",
             State::Crashed => "red",
             State::Unknown => "yellow",
-        }
-    }
-}
-
-impl EcsState {
-    /// We return a &str rather than a Color here, since `comfy-table` re-exports
-    /// crossterm::style::Color and we depend on both `comfy-table` and `crossterm`
-    /// we may end up with two different versions of Color.
-    pub fn get_color(&self) -> &str {
-        match self {
-            EcsState::Pending => "dark_yellow",
-            EcsState::Building => "yellow",
-            EcsState::InProgress => "cyan",
-            EcsState::Running => "green",
-            EcsState::Stopped => "dark_blue",
-            EcsState::Stopping => "blue",
-            EcsState::Failed => "red",
-            EcsState::Unknown => "grey",
         }
     }
 }
@@ -273,6 +255,12 @@ pub fn get_deployments_table(
     }
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct UploadArchiveResponseBeta {
+    /// The S3 object version ID of the uploaded object
+    pub archive_version_id: String,
+}
+
 #[derive(Default, Deserialize, Serialize)]
 pub struct DeploymentRequest {
     /// Tar archive
@@ -296,8 +284,8 @@ pub enum DeploymentRequestBeta {
 
 #[derive(Default, Deserialize, Serialize)]
 pub struct DeploymentRequestBuildArchiveBeta {
-    /// Zip archive
-    pub data: Vec<u8>,
+    /// The S3 object version ID of the archive to use
+    pub archive_version_id: String,
     pub build_args: Option<BuildArgsBeta>,
     /// Secrets to add before this deployment.
     /// TODO: Remove this in favour of a separate secrets uploading action.
@@ -305,8 +293,18 @@ pub struct DeploymentRequestBuildArchiveBeta {
     pub build_meta: Option<BuildMetaBeta>,
 }
 
+#[derive(Deserialize, Serialize, Default)]
+#[serde(tag = "type", content = "content")]
+pub enum BuildArgsBeta {
+    Rust(BuildArgsRustBeta),
+    #[default]
+    Unknown,
+}
+
 #[derive(Deserialize, Serialize)]
-pub struct BuildArgsBeta {
+pub struct BuildArgsRustBeta {
+    /// Version of shuttle-runtime used by this crate
+    pub shuttle_runtime_version: Option<String>,
     /// Use the built in cargo chef setup for caching
     pub cargo_chef: bool,
     /// Build with the built in `cargo build` setup
@@ -323,9 +321,10 @@ pub struct BuildArgsBeta {
     pub mold: bool,
 }
 
-impl Default for BuildArgsBeta {
+impl Default for BuildArgsRustBeta {
     fn default() -> Self {
         Self {
+            shuttle_runtime_version: Default::default(),
             cargo_chef: true,
             cargo_build: true,
             package_name: Default::default(),
@@ -334,23 +333,6 @@ impl Default for BuildArgsBeta {
             no_default_features: Default::default(),
             mold: Default::default(),
         }
-    }
-}
-
-impl BuildArgsBeta {
-    pub fn into_vars(&self) -> [(&str, &str); 7] {
-        [
-            ("CARGO_CHEF", if self.cargo_chef { "true" } else { "" }),
-            ("CARGO_BUILD", if self.cargo_build { "true" } else { "" }),
-            ("PACKAGE", self.package_name.as_deref().unwrap_or_default()),
-            ("BIN", self.binary_name.as_deref().unwrap_or_default()),
-            ("FEATURES", self.features.as_deref().unwrap_or_default()),
-            (
-                "NO_DEFAULT_FEATURES",
-                if self.no_default_features { "true" } else { "" },
-            ),
-            ("MOLD", if self.mold { "true" } else { "" }),
-        ]
     }
 }
 

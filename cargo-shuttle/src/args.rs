@@ -35,7 +35,7 @@ pub struct ShuttleArgs {
     /// Disable network requests that are not strictly necessary. Limits some features.
     #[arg(long, env = "SHUTTLE_OFFLINE")]
     pub offline: bool,
-    /// Turn on tracing output for cargo-shuttle and shuttle libraries.
+    /// Turn on tracing output for Shuttle libraries. (WARNING: can print sensitive data)
     #[arg(long, env = "SHUTTLE_DEBUG")]
     pub debug: bool,
     /// Target Shuttle's development environment
@@ -168,6 +168,8 @@ pub enum DeploymentCommand {
         /// ID of deployment to get status for
         id: Option<String>,
     },
+    /// BETA: Stop running deployment(s)
+    Stop,
 }
 
 #[derive(Parser)]
@@ -262,6 +264,9 @@ pub struct DeployArgs {
     /// BETA: Deploy this Docker image instead of building one
     #[arg(long, short = 'i', hide = true)]
     pub image: Option<String>, // TODO?: Make this a subcommand instead? `cargo shuttle deploy image ...`
+    /// BETA: Don't follow the deployment status, exit after the deployment begins
+    #[arg(long, visible_alias = "nf", hide = true)]
+    pub no_follow: bool,
 
     /// Allow deployment with uncommitted files
     #[arg(long, visible_alias = "ad")]
@@ -272,6 +277,9 @@ pub struct DeployArgs {
     /// Don't display timestamps and log origin tags
     #[arg(long)]
     pub raw: bool,
+    /// Output the deployment archive to a file instead of sending a deployment request
+    #[arg(long)]
+    pub output_archive: Option<PathBuf>,
 
     #[command(flatten)]
     pub secret_args: SecretsArgs,
