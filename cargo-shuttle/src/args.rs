@@ -30,16 +30,16 @@ pub struct ShuttleArgs {
     pub project_args: ProjectArgs,
     /// Run this command against the API at the supplied URL
     /// (allows targeting a custom deployed instance for this command only, mainly for development)
-    #[arg(long, env = "SHUTTLE_API")]
+    #[arg(global = true, long, env = "SHUTTLE_API")]
     pub api_url: Option<String>,
     /// Disable network requests that are not strictly necessary. Limits some features.
-    #[arg(long, env = "SHUTTLE_OFFLINE")]
+    #[arg(global = true, long, env = "SHUTTLE_OFFLINE")]
     pub offline: bool,
     /// Turn on tracing output for Shuttle libraries. (WARNING: can print sensitive data)
-    #[arg(long, env = "SHUTTLE_DEBUG")]
+    #[arg(global = true, long, env = "SHUTTLE_DEBUG")]
     pub debug: bool,
     /// Target Shuttle's development environment
-    #[arg(long, env = "SHUTTLE_BETA", hide = true)]
+    #[arg(global = true, long, env = "SHUTTLE_BETA", hide = true)]
     pub beta: bool,
 
     #[command(subcommand)]
@@ -52,9 +52,10 @@ pub struct ProjectArgs {
     /// Specify the working directory
     #[arg(global = true, long, visible_alias = "wd", default_value = ".", value_parser = OsStringValueParser::new().try_map(parse_path))]
     pub working_directory: PathBuf,
-    /// Specify the name of the project (overrides crate name)
-    #[arg(global = true, long)]
-    pub name: Option<String>,
+    /// Specify the name or id of the project (overrides crate name)
+    #[arg(global = true, long = "name", visible_alias = "id")]
+    // in alpha mode, this is always a name
+    pub name_or_id: Option<String>,
 }
 
 impl ProjectArgs {
@@ -99,29 +100,35 @@ impl ProjectArgs {
 /// for more information.
 #[derive(Parser)]
 pub enum Command {
-    /// Create a new Shuttle project
+    /// Generate a Shuttle project from a template
     Init(InitArgs),
     /// Run a Shuttle service locally
     Run(RunArgs),
     /// Deploy a Shuttle service
     Deploy(DeployArgs),
     /// Manage deployments of a Shuttle service
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "depl")]
     Deployment(DeploymentCommand),
     /// View the status of a Shuttle service
     Status,
-    /// Stop this Shuttle service
+    /// Stop a Shuttle service
     Stop,
-    /// View the logs of a deployment in this Shuttle service
+    /// View logs of a Shuttle service
     Logs(LogsArgs),
-    /// List or manage projects on Shuttle
-    #[command(subcommand)]
+    /// Manage projects on Shuttle
+    #[command(subcommand, visible_alias = "proj")]
     Project(ProjectCommand),
-    /// Manage resources of a Shuttle project
-    #[command(subcommand)]
+    /// Manage resources
+    #[command(subcommand, visible_alias = "res")]
     Resource(ResourceCommand),
+    /// BETA: Manage SSL certificates for custom domains
+    #[command(subcommand, visible_alias = "cert", hide = true)]
+    Certificate(CertificateCommand),
     /// Remove cargo build artifacts in the Shuttle environment
     Clean,
+    /// BETA: Show info about your Shuttle account
+    #[command(visible_alias = "acc", hide = true)]
+    Account,
     /// Login to the Shuttle platform
     Login(LoginArgs),
     /// Log out of the Shuttle platform
@@ -131,6 +138,12 @@ pub enum Command {
     Generate(GenerateCommand),
     /// Open an issue on GitHub and provide feedback
     Feedback,
+    /// Upgrade the cargo-shuttle binary
+    Upgrade {
+        /// Install an unreleased version from the repository's main branch
+        #[arg(long)]
+        preview: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -156,7 +169,8 @@ pub struct TableArgs {
 
 #[derive(Parser)]
 pub enum DeploymentCommand {
-    /// List all the deployments for a service
+    /// List the deployments for a service
+    #[command(visible_alias = "ls")]
     List {
         #[arg(long, default_value = "1")]
         /// Which page to display
@@ -175,12 +189,14 @@ pub enum DeploymentCommand {
         id: Option<String>,
     },
     /// BETA: Stop running deployment(s)
+    #[command(hide = true)]
     Stop,
 }
 
 #[derive(Parser)]
 pub enum ResourceCommand {
-    /// List all the resources for a project
+    /// List the resources for a project
+    #[command(visible_alias = "ls")]
     List {
         #[command(flatten)]
         table: TableArgs,
@@ -190,11 +206,35 @@ pub enum ResourceCommand {
         show_secrets: bool,
     },
     /// Delete a resource
+    #[command(visible_alias = "rm")]
     Delete {
         /// Type of the resource to delete.
         /// Use the string in the 'Type' column as displayed in the `resource list` command.
         /// For example, 'database::shared::postgres'.
         resource_type: resource::Type,
+        #[command(flatten)]
+        confirmation: ConfirmationArgs,
+    },
+}
+
+#[derive(Parser)]
+pub enum CertificateCommand {
+    /// Add an SSL certificate for a custom domain
+    Add {
+        /// Domain name
+        domain: String,
+    },
+    /// List the certificates for a project
+    #[command(visible_alias = "ls")]
+    List {
+        #[command(flatten)]
+        table: TableArgs,
+    },
+    /// Delete an SSL certificate
+    #[command(visible_alias = "rm")]
+    Delete {
+        /// Domain name
+        domain: String,
         #[command(flatten)]
         confirmation: ConfirmationArgs,
     },
@@ -216,6 +256,7 @@ pub enum ProjectCommand {
     /// Destroy and create an environment for this project on Shuttle
     Restart(ProjectStartArgs),
     /// List all projects you have access to
+    #[command(visible_alias = "ls")]
     List {
         // deprecated args, kept around to not break
         #[arg(long, hide = true)]
@@ -227,7 +268,10 @@ pub enum ProjectCommand {
         table: TableArgs,
     },
     /// Delete a project and all linked data
+    #[command(visible_alias = "rm")]
     Delete(ConfirmationArgs),
+    /// Link this workspace to a Shuttle project
+    Link,
 }
 
 #[derive(Parser, Debug)]
@@ -258,6 +302,7 @@ pub struct LogoutArgs {
     #[arg(long)]
     pub reset_api_key: bool,
 }
+
 #[derive(Parser, Default)]
 pub struct DeployArgs {
     /// BETA: Deploy this Docker image instead of building one
@@ -555,7 +600,7 @@ mod tests {
     fn workspace_path() {
         let project_args = ProjectArgs {
             working_directory: path_from_workspace_root("examples/axum/hello-world/src"),
-            name: None,
+            name_or_id: None,
         };
 
         assert_eq!(
@@ -568,7 +613,7 @@ mod tests {
     fn project_name() {
         let project_args = ProjectArgs {
             working_directory: path_from_workspace_root("examples/axum/hello-world/src"),
-            name: None,
+            name_or_id: None,
         };
 
         assert_eq!(
@@ -583,7 +628,7 @@ mod tests {
             working_directory: path_from_workspace_root(
                 "examples/rocket/workspace/hello-world/src",
             ),
-            name: None,
+            name_or_id: None,
         };
 
         assert_eq!(

@@ -14,7 +14,7 @@ BUILDX_FLAGS=$(BUILDX_OP) $(PLATFORM_FLAGS)
 
 # The Rust version used by our containers
 # Can be updated to the latest stable
-RUSTUP_TOOLCHAIN=1.80.0
+RUSTUP_TOOLCHAIN=1.81.0
 
 TAG?=$(shell git describe --tags --abbrev=0)
 AUTH_TAG?=$(TAG)
@@ -135,9 +135,13 @@ DOCKER_COMPOSE_ENV=\
 	DOCKER_SOCK=$(DOCKER_SOCK)\
 	SHUTTLE_ENV=$(SHUTTLE_ENV)\
 	SHUTTLE_SERVICE_VERSION=$(SHUTTLE_SERVICE_VERSION)\
-	PERMIT_API_KEY=$(PERMIT_API_KEY)
+	PERMIT_API_KEY=$(PERMIT_API_KEY)\
+	PERMIT_DEV_API_KEY=$(PERMIT_DEV_API_KEY)
 
-.PHONY: clean deep-clean images the-shuttle-images shuttle-% postgres otel deploy test docker-compose.rendered.yml up down
+.PHONY: envfile clean deep-clean images the-shuttle-images shuttle-% postgres otel deploy test docker-compose.rendered.yml up down
+
+envfile:
+	echo $(DOCKER_COMPOSE_ENV) > dockerenv
 
 clean:
 	rm .shuttle-*

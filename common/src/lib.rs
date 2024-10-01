@@ -1,3 +1,5 @@
+#[cfg(feature = "service")]
+pub mod certificate;
 #[cfg(feature = "claims")]
 pub mod claims;
 pub mod constants;
@@ -173,13 +175,15 @@ impl DatabaseInfo {
 }
 
 /// Holds the data for building a database connection string on the Beta platform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[typeshare::typeshare]
 pub struct DatabaseInfoBeta {
     engine: String,
     role_name: String,
-    role_password: Secret<String>,
+    role_password: String,
     database_name: String,
     port: String,
+    #[serde(alias = "hostname_shuttle")] // compatibility to parse from a `DatabaseInfo`
     hostname: String,
     /// The RDS instance name, which is required for deleting provisioned RDS instances, it's
     /// optional because it isn't needed for shared PG deletion.
@@ -199,7 +203,7 @@ impl DatabaseInfoBeta {
         Self {
             engine,
             role_name,
-            role_password: Secret::new(role_password),
+            role_password,
             database_name,
             port,
             hostname,
@@ -214,9 +218,9 @@ impl DatabaseInfoBeta {
             self.engine,
             self.role_name,
             if show_password {
-                self.role_password.expose()
+                &self.role_password
             } else {
-                self.role_password.redacted()
+                "********"
             },
             self.hostname,
             self.port,
@@ -234,6 +238,13 @@ impl DatabaseInfoBeta {
 
     pub fn instance_name(&self) -> Option<String> {
         self.instance_name.clone()
+    }
+}
+
+// Don't leak password in Debug
+impl std::fmt::Debug for DatabaseInfoBeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DatabaseInfo {{ {:?} }}", self.connection_string(false))
     }
 }
 

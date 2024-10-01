@@ -13,13 +13,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use args::{ConfirmationArgs, GenerateCommand, TableArgs};
+use chrono::Utc;
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
 use clap_complete::{generate, Shell};
 use clap_mangen::Man;
-use config::RequestContext;
 use crossterm::style::Stylize;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use flate2::write::GzEncoder;
@@ -35,28 +35,28 @@ use reqwest::header::HeaderMap;
 use shuttle_api_client::ShuttleApiClient;
 use shuttle_common::{
     constants::{
-        headers::X_CARGO_SHUTTLE_VERSION, API_URL_DEFAULT, DEFAULT_IDLE_MINUTES, EXAMPLES_REPO,
-        EXECUTABLE_DIRNAME, RESOURCE_SCHEMA_VERSION, RUNTIME_NAME, SHUTTLE_GH_ISSUE_URL,
-        SHUTTLE_IDLE_DOCS_URL, SHUTTLE_INSTALL_DOCS_URL, SHUTTLE_LOGIN_URL, STORAGE_DIRNAME,
-        TEMPLATES_SCHEMA_VERSION,
+        headers::X_CARGO_SHUTTLE_VERSION, API_URL_BETA, API_URL_DEFAULT, DEFAULT_IDLE_MINUTES,
+        EXAMPLES_REPO, EXECUTABLE_DIRNAME, RESOURCE_SCHEMA_VERSION, RUNTIME_NAME,
+        SHUTTLE_GH_ISSUE_URL, SHUTTLE_GH_REPO_URL, SHUTTLE_IDLE_DOCS_URL, SHUTTLE_INSTALL_DOCS_URL,
+        SHUTTLE_LOGIN_URL, STORAGE_DIRNAME, TEMPLATES_SCHEMA_VERSION,
     },
-    deployment::{EcsState, DEPLOYER_END_MESSAGES_BAD, DEPLOYER_END_MESSAGES_GOOD},
+    deployment::{DeploymentStateBeta, DEPLOYER_END_MESSAGES_BAD, DEPLOYER_END_MESSAGES_GOOD},
     log::LogsRange,
     models::{
         deployment::{
             deployments_table_beta, get_deployments_table, BuildArgsBeta, BuildArgsRustBeta,
             BuildMetaBeta, DeploymentRequest, DeploymentRequestBeta,
-            DeploymentRequestBuildArchiveBeta, DeploymentRequestImageBeta, ResponseBeta,
+            DeploymentRequestBuildArchiveBeta, DeploymentRequestImageBeta, DeploymentResponseBeta,
             CREATE_SERVICE_BODY_LIMIT, GIT_STRINGS_MAX_LENGTH,
         },
         error::ApiError,
         project,
-        resource::get_resource_tables,
+        resource::{get_certificates_table_beta, get_resource_tables, get_resource_tables_beta},
     },
     resource::{self, ResourceInput, ShuttleResourceOutput},
     semvers_are_compatible,
     templates::TemplatesSchema,
-    ApiKey, DatabaseResource, DbInput, LogItem, VersionInfo,
+    ApiKey, DatabaseResource, DbInput, LogItem, LogItemBeta, VersionInfo,
 };
 use shuttle_proto::{
     provisioner::{provisioner_server::Provisioner, DatabaseRequest},
@@ -72,20 +72,24 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::time::{sleep, Duration};
 use tonic::{Request, Status};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter};
 use uuid::Uuid;
 use zip::write::FileOptions;
 
-pub use crate::args::{Command, ProjectArgs, RunArgs, ShuttleArgs};
 use crate::args::{
-    DeployArgs, DeploymentCommand, InitArgs, LoginArgs, LogoutArgs, LogsArgs, ProjectCommand,
-    ProjectStartArgs, ResourceCommand, TemplateLocation,
+    CertificateCommand, ConfirmationArgs, DeployArgs, DeploymentCommand, GenerateCommand, InitArgs,
+    LoginArgs, LogoutArgs, LogsArgs, ProjectCommand, ProjectStartArgs, ResourceCommand, TableArgs,
+    TemplateLocation,
 };
+pub use crate::args::{Command, ProjectArgs, RunArgs, ShuttleArgs};
+use crate::config::RequestContext;
+use crate::provisioner_server::beta::{ProvApiState, ProvisionerServerBeta};
 use crate::provisioner_server::LocalProvisioner;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Returns the args and whether the PATH arg of the init command was explicitly given
+/// Returns the args and whether the PATH arg of the init command was explicitly given
 pub fn parse_args() -> (ShuttleArgs, bool) {
     let matches = ShuttleArgs::command().get_matches();
     let args =
@@ -99,17 +103,42 @@ pub fn parse_args() -> (ShuttleArgs, bool) {
     (args, provided_path_to_init)
 }
 
+pub fn setup_tracing(debug: bool) {
+    registry()
+        .with(fmt::layer())
+        .with(
+            // let user set RUST_LOG if they want to
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                if debug {
+                    EnvFilter::new("info,cargo_shuttle=trace,shuttle=trace")
+                } else {
+                    EnvFilter::default()
+                }
+            }),
+        )
+        .init();
+}
+
+#[derive(PartialEq)]
+pub enum Binary {
+    CargoShuttle,
+    Shuttle,
+}
+
 pub struct Shuttle {
     ctx: RequestContext,
     client: Option<ShuttleApiClient>,
     version_info: Option<VersionInfo>,
+    /// Strings to print at the end of command execution
     version_warnings: Vec<String>,
-    /// alter behaviour to interact with the new platform
+    /// Alter behaviour to interact with the new platform
     beta: bool,
+    /// Alter behaviour based on which CLI is used
+    bin: Binary,
 }
 
 impl Shuttle {
-    pub fn new() -> Result<Self> {
+    pub fn new(bin: Binary) -> Result<Self> {
         let ctx = RequestContext::load_global()?;
         Ok(Self {
             ctx,
@@ -117,42 +146,45 @@ impl Shuttle {
             version_info: None,
             version_warnings: vec![],
             beta: false,
+            bin,
         })
     }
 
-    pub async fn run(
-        mut self,
-        args: ShuttleArgs,
-        provided_path_to_init: bool,
-    ) -> Result<CommandOutcome> {
+    pub async fn run(mut self, mut args: ShuttleArgs, provided_path_to_init: bool) -> Result<()> {
+        if self.bin == Binary::Shuttle {
+            // beta is always enabled in `shuttle`
+            args.beta = true;
+        }
         self.beta = args.beta;
         if self.beta {
-            if matches!(
-                args.cmd,
-                Command::Project(ProjectCommand::Stop { .. } | ProjectCommand::Restart { .. })
-            ) {
-                eprintln!("This command is discontinued on the beta platform.");
-                return Ok(CommandOutcome::Ok);
+            if matches!(args.cmd, Command::Project(ProjectCommand::Restart { .. })) {
+                bail!("This command is discontinued on the beta platform. Deploy to start a new deployment.");
             }
             if matches!(args.cmd, Command::Status) {
-                eprintln!("This command is deprecated on the beta platform. Use `deployment status` instead.");
-                return Ok(CommandOutcome::Ok);
+                bail!("This command is discontinued on the beta platform. Use `deployment status` instead.");
             }
-            if matches!(args.cmd, Command::Stop) {
-                eprintln!("This command is deprecated on the beta platform. Use `deployment stop` instead.");
-                return Ok(CommandOutcome::Ok);
+            if matches!(
+                args.cmd,
+                Command::Stop | Command::Project(ProjectCommand::Stop { .. })
+            ) {
+                bail!("This command is discontinued on the beta platform. Use `deployment stop` instead.");
             }
             if matches!(args.cmd, Command::Clean) {
-                eprintln!("This command is not yet implemented on the beta platform.");
-                return Ok(CommandOutcome::Ok);
+                bail!("This command is not yet implemented on the beta platform.");
             }
-            eprintln!("INFO: Using beta platform API");
-        } else if matches!(args.cmd, Command::Deployment(DeploymentCommand::Stop)) {
-            eprintln!("This command is not supported on the legacy platform.");
-            return Ok(CommandOutcome::Ok);
+            if self.bin == Binary::CargoShuttle {
+                eprintln!("INFO: Using beta platform API");
+            }
+        } else if matches!(
+            args.cmd,
+            Command::Deployment(DeploymentCommand::Stop)
+                | Command::Account
+                | Command::Project(ProjectCommand::Link)
+        ) {
+            bail!("This command is not supported on the legacy platform. Set --beta or SHUTTLE_BETA=true.");
         }
         if let Some(ref url) = args.api_url {
-            if url != API_URL_DEFAULT {
+            if (!self.beta && url != API_URL_DEFAULT) || (self.beta && url != API_URL_BETA) {
                 eprintln!("INFO: Targeting non-standard API: {url}");
             }
             if url.ends_with('/') {
@@ -161,29 +193,6 @@ impl Shuttle {
         }
         self.ctx.set_api_url(args.api_url);
 
-        // All commands that need to know which project is being handled
-        if matches!(
-            args.cmd,
-            Command::Deploy(..)
-                | Command::Deployment(..)
-                | Command::Resource(..)
-                | Command::Project(
-                    // ProjectCommand::List does not need to know which project we are in
-                    ProjectCommand::Start { .. }
-                        | ProjectCommand::Stop { .. }
-                        | ProjectCommand::Restart { .. }
-                        | ProjectCommand::Status { .. }
-                        | ProjectCommand::Delete { .. }
-                )
-                | Command::Stop
-                | Command::Clean
-                | Command::Status
-                | Command::Logs { .. }
-                | Command::Run(..)
-        ) {
-            self.load_project(&args.project_args)?;
-        }
-
         // All commands that call the API
         if matches!(
             args.cmd,
@@ -191,10 +200,12 @@ impl Shuttle {
                 | Command::Deploy(..)
                 | Command::Status
                 | Command::Logs { .. }
+                | Command::Account
                 | Command::Login(..)
                 | Command::Logout(..)
                 | Command::Deployment(..)
                 | Command::Resource(..)
+                | Command::Certificate(..)
                 | Command::Stop
                 | Command::Clean
                 | Command::Project(..)
@@ -216,6 +227,35 @@ impl Shuttle {
             }
         }
 
+        // All commands that need to know which project is being handled
+        if matches!(
+            args.cmd,
+            Command::Deploy(..)
+                | Command::Deployment(..)
+                | Command::Resource(..)
+                | Command::Certificate(..)
+                | Command::Project(
+                    // ProjectCommand::List does not need to know which project we are in
+                    ProjectCommand::Start { .. }
+                        | ProjectCommand::Stop { .. }
+                        | ProjectCommand::Restart { .. }
+                        | ProjectCommand::Status { .. }
+                        | ProjectCommand::Delete { .. }
+                        | ProjectCommand::Link
+                )
+                | Command::Stop
+                | Command::Clean
+                | Command::Status
+                | Command::Logs { .. }
+                | Command::Run(..)
+        ) {
+            self.load_project(
+                &args.project_args,
+                matches!(args.cmd, Command::Project(ProjectCommand::Link)),
+            )
+            .await?;
+        }
+
         let res = match args.cmd {
             Command::Init(init_args) => {
                 self.init(
@@ -230,10 +270,17 @@ impl Shuttle {
                 GenerateCommand::Manpage => self.generate_manpage(),
                 GenerateCommand::Shell { shell, output } => self.complete(shell, output),
             },
+            Command::Account => self.account().await,
             Command::Login(login_args) => self.login(login_args, args.offline).await,
             Command::Logout(logout_args) => self.logout(logout_args).await,
-            Command::Feedback => self.feedback(),
-            Command::Run(run_args) => self.local_run(run_args).await,
+            Command::Feedback => feedback(),
+            Command::Run(run_args) => {
+                if self.beta {
+                    self.local_run_beta(run_args, args.debug).await
+                } else {
+                    self.local_run(run_args).await
+                }
+            }
             Command::Deploy(deploy_args) => self.deploy(deploy_args).await,
             Command::Status => self.status().await,
             Command::Logs(logs_args) => {
@@ -256,16 +303,30 @@ impl Shuttle {
                 ResourceCommand::List {
                     table,
                     show_secrets,
-                } => self.resources_list(table, show_secrets).await,
+                } => {
+                    if self.beta {
+                        self.resources_list_beta(table, show_secrets).await
+                    } else {
+                        self.resources_list(table, show_secrets).await
+                    }
+                }
                 ResourceCommand::Delete {
                     resource_type,
                     confirmation: ConfirmationArgs { yes },
                 } => self.resource_delete(&resource_type, yes).await,
             },
+            Command::Certificate(cmd) => match cmd {
+                CertificateCommand::Add { domain } => self.add_certificate(domain).await,
+                CertificateCommand::List { table } => self.list_certificates(table).await,
+                CertificateCommand::Delete {
+                    domain,
+                    confirmation: ConfirmationArgs { yes },
+                } => self.delete_certificate(domain, yes).await,
+            },
             Command::Project(cmd) => match cmd {
                 ProjectCommand::Start(ProjectStartArgs { idle_minutes }) => {
                     if self.beta {
-                        self.project_start_beta().await
+                        self.project_create_beta().await
                     } else {
                         self.project_start(idle_minutes).await
                     }
@@ -283,7 +344,9 @@ impl Shuttle {
                 ProjectCommand::List { table, .. } => self.projects_list(table).await,
                 ProjectCommand::Stop => self.project_stop().await,
                 ProjectCommand::Delete(ConfirmationArgs { yes }) => self.project_delete(yes).await,
+                ProjectCommand::Link => Ok(()), // logic is done in `load_local`
             },
+            Command::Upgrade { preview } => update_cargo_shuttle(preview).await,
         };
 
         for w in self.version_warnings {
@@ -349,12 +412,12 @@ impl Shuttle {
         mut project_args: ProjectArgs,
         provided_path_to_init: bool,
         offline: bool,
-    ) -> Result<CommandOutcome> {
+    ) -> Result<()> {
         // Turns the template or git args (if present) to a repo+folder.
         let git_template = args.git_template()?;
         let no_git = args.no_git;
 
-        let needs_name = project_args.name.is_none();
+        let needs_name = project_args.name_or_id.is_none();
         let needs_template = git_template.is_none();
         let needs_path = !provided_path_to_init;
         let needs_login = self.ctx.api_key().is_err() && args.login_args.api_key.is_none();
@@ -384,7 +447,7 @@ impl Shuttle {
         let mut prev_name: Option<String> = None;
         loop {
             // prompt if interactive
-            let name: String = if let Some(name) = project_args.name.clone() {
+            let name: String = if let Some(name) = project_args.name_or_id.clone() {
                 name
             } else {
                 // not using `validate_with` due to being blocking.
@@ -395,7 +458,7 @@ impl Shuttle {
             let force_name = args.force_name
                 || (needs_name && prev_name.as_ref().is_some_and(|prev| prev == &name));
             if force_name {
-                project_args.name = Some(name);
+                project_args.name_or_id = Some(name);
                 break;
             }
             // validate and take action based on result
@@ -422,9 +485,12 @@ impl Shuttle {
 
         // 3. Confirm the project directory
         let path = if needs_path {
-            let path = args
-                .path
-                .join(project_args.name.as_ref().expect("name should be set"));
+            let path = args.path.join(
+                project_args
+                    .name_or_id
+                    .as_ref()
+                    .expect("name should be set"),
+            );
 
             loop {
                 println!("Where should we create this project?");
@@ -587,10 +653,10 @@ impl Shuttle {
         };
 
         // 5. Initialize locally
-        init::generate_project(
+        crate::init::generate_project(
             path.clone(),
             project_args
-                .name
+                .name_or_id
                 .as_ref()
                 .expect("to have a project name provided"),
             &template,
@@ -610,7 +676,7 @@ impl Shuttle {
                 .with_prompt(format!(
                     r#"Claim the project name "{}" by starting a project container on Shuttle?"#,
                     project_args
-                        .name
+                        .name_or_id
                         .as_ref()
                         .expect("to have a project name provided")
                 ))
@@ -629,9 +695,9 @@ impl Shuttle {
         if should_create_environment {
             // Set the project working directory path to the init path,
             // so `load_project` is ran with the correct project path
-            project_args.working_directory = path.clone();
+            project_args.working_directory.clone_from(&path);
 
-            self.load_project(&project_args)?;
+            self.load_project(&project_args, false).await?;
             self.project_start(DEFAULT_IDLE_MINUTES).await?;
         }
 
@@ -661,7 +727,7 @@ impl Shuttle {
             }
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
     /// true -> success/neutral. false -> try again.
@@ -675,7 +741,7 @@ impl Shuttle {
             Ok(true) => {
                 // inner value is inverted on beta
                 if self.beta {
-                    project_args.name = Some(name);
+                    project_args.name_or_id = Some(name);
                     return true;
                 }
 
@@ -686,7 +752,7 @@ impl Shuttle {
             }
             // not possible on beta
             Ok(false) => {
-                project_args.name = Some(name);
+                project_args.name_or_id = Some(name);
 
                 true
             }
@@ -702,7 +768,7 @@ impl Shuttle {
                 }
                 // Else, the API error was about something else.
                 // Ignore and keep going to not prevent the flow of the init command.
-                project_args.name = Some(name);
+                project_args.name_or_id = Some(name);
                 println!(
                     "{}",
                     "Failed to check if project name is available.".yellow()
@@ -713,22 +779,100 @@ impl Shuttle {
         }
     }
 
-    pub fn load_project(&mut self, project_args: &ProjectArgs) -> Result<()> {
-        trace!("loading project arguments: {project_args:?}");
+    pub async fn load_project(&mut self, project_args: &ProjectArgs, link_cmd: bool) -> Result<()> {
+        trace!("project arguments: {project_args:?}");
 
-        self.ctx.load_local(project_args)
+        self.ctx.load_local(project_args)?;
+        if self.beta {
+            // load project id from file if exists
+            self.ctx.load_local_internal(project_args)?;
+            // translate project name to project id if a name was given
+            if let Some(name) = project_args.name_or_id.as_ref() {
+                if !name.starts_with("proj_") {
+                    trace!("mapping project name to project id");
+                    let proj = self
+                        .client
+                        .as_ref()
+                        .unwrap()
+                        .get_projects_list_beta()
+                        .await?
+                        .projects
+                        .into_iter()
+                        .find(|p| p.name == *name);
+                    if let Some(proj) = proj {
+                        trace!("found project by name");
+                        self.ctx.set_project_id(proj.id);
+                    }
+                }
+                // if called from Link command, command-line override is saved to file
+                if link_cmd {
+                    eprintln!("Linking to project {}", self.ctx.project_id());
+                    self.ctx.save_local_internal()?;
+                    return Ok(());
+                }
+            }
+            // if project id is still not known or an explicit linking is wanted, start the linking prompt
+            if !self.ctx.project_id_found() || link_cmd {
+                self.project_link(None).await?;
+            }
+        }
+
+        Ok(())
     }
 
-    /// Provide feedback on GitHub.
-    fn feedback(&self) -> Result<CommandOutcome> {
-        let _ = webbrowser::open(SHUTTLE_GH_ISSUE_URL);
-        println!("If your browser did not open automatically, go to {SHUTTLE_GH_ISSUE_URL}");
+    async fn project_link(&mut self, id_or_name: Option<String>) -> Result<()> {
+        let client = self.client.as_ref().unwrap();
+        let projs = client.get_projects_list_beta().await?.projects;
 
-        Ok(CommandOutcome::Ok)
+        let theme = ColorfulTheme::default();
+
+        let proj = if let Some(id_or_name) = id_or_name {
+            projs
+                .into_iter()
+                .find(|p| p.id == id_or_name || p.name == id_or_name)
+                .ok_or(anyhow!("Did not find project '{id_or_name}'."))?
+        } else {
+            eprintln!("Which project do you want to link this directory to?");
+
+            let mut items = projs.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+            items.extend_from_slice(&["[CREATE NEW]".to_string()]);
+            let index = Select::with_theme(&theme)
+                .items(&items)
+                .default(0)
+                .interact()?;
+
+            // if last item selected (Create new)
+            if index == projs.len() {
+                let name: String = Input::with_theme(&theme)
+                    .with_prompt("Project name")
+                    .interact()?;
+
+                let project = client.create_project_beta(&name).await?;
+                eprintln!("Created project '{}' with id {}", project.name, project.id);
+
+                project
+            } else {
+                projs[index].clone()
+            }
+        };
+
+        eprintln!("Linking to project '{}' with id {}", proj.name, proj.id);
+        self.ctx.set_project_id(proj.id);
+        self.ctx.save_local_internal()?;
+
+        Ok(())
+    }
+
+    async fn account(&self) -> Result<()> {
+        let client = self.client.as_ref().unwrap();
+        let user = client.get_current_user_beta().await?;
+        print!("{}", user.to_string_colored());
+
+        Ok(())
     }
 
     /// Log in with the given API key or after prompting the user for one.
-    async fn login(&mut self, login_args: LoginArgs, offline: bool) -> Result<CommandOutcome> {
+    async fn login(&mut self, login_args: LoginArgs, offline: bool) -> Result<()> {
         let api_key_str = match login_args.api_key {
             Some(api_key) => api_key,
             None => {
@@ -759,7 +903,7 @@ impl Shuttle {
                     eprintln!("INFO: Skipping API key verification");
                 } else {
                     let u = client
-                        .get_current_user()
+                        .get_current_user_beta()
                         .await
                         .context("failed to check API key validity")?;
                     println!("Logged in as {} ({})", u.name.bold(), u.id.bold());
@@ -767,10 +911,10 @@ impl Shuttle {
             }
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn logout(&mut self, logout_args: LogoutArgs) -> Result<CommandOutcome> {
+    async fn logout(&mut self, logout_args: LogoutArgs) -> Result<()> {
         if logout_args.reset_api_key {
             self.reset_api_key()
                 .await
@@ -781,7 +925,7 @@ impl Shuttle {
         self.ctx.clear_api_key()?;
         println!("Successfully logged out.");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
     async fn reset_api_key(&self) -> Result<()> {
@@ -795,15 +939,15 @@ impl Shuttle {
         })
     }
 
-    async fn stop_beta(&self) -> Result<CommandOutcome> {
+    async fn stop_beta(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
-        let p = self.ctx.project_name();
-        let res = client.stop_service_beta(p).await?;
+        let pid = self.ctx.project_id();
+        let res = client.stop_service_beta(pid).await?;
         println!("{res}");
         wait_with_spinner(2000, |_, pb| async move {
-            let deployment = client.get_current_deployment_beta(p).await?;
+            let deployment = client.get_current_deployment_beta(pid).await?;
 
-            let get_cleanup = |d: Option<ResponseBeta>| {
+            let get_cleanup = |d: Option<DeploymentResponseBeta>| {
                 move || {
                     if let Some(d) = d {
                         println!("{}", d.to_string_colored());
@@ -818,22 +962,22 @@ impl Shuttle {
             pb.set_message(deployment.to_string_summary_colored());
             let cleanup = get_cleanup(Some(deployment));
             match state {
-                    EcsState::Pending
-                    | EcsState::Stopping
-                    | EcsState::InProgress
-                    | EcsState::Running => Ok(None),
-                    EcsState::Building // a building deployment should take it back to InProgress then Running, so don't follow that sequence
-                    | EcsState::Failed
-                    | EcsState::Stopped
-                    | EcsState::Unknown => Ok(Some(cleanup)),
+                    DeploymentStateBeta::Pending
+                    | DeploymentStateBeta::Stopping
+                    | DeploymentStateBeta::InProgress
+                    | DeploymentStateBeta::Running => Ok(None),
+                    DeploymentStateBeta::Building // a building deployment should take it back to InProgress then Running, so don't follow that sequence
+                    | DeploymentStateBeta::Failed
+                    | DeploymentStateBeta::Stopped
+                    | DeploymentStateBeta::Unknown => Ok(Some(cleanup)),
                 }
         })
         .await?;
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn stop(&self) -> Result<CommandOutcome> {
+    async fn stop(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         let p = self.ctx.project_name();
         wait_with_spinner(500, |i, pb| async move {
@@ -865,20 +1009,20 @@ impl Shuttle {
         .await
         .map_err(suggestions::deployment::stop_deployment_failure)?;
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    fn complete(&self, shell: Shell, output: Option<PathBuf>) -> Result<CommandOutcome> {
+    fn complete(&self, shell: Shell, output: Option<PathBuf>) -> Result<()> {
         let name = env!("CARGO_PKG_NAME");
         let mut app = Command::command();
         match output {
             Some(path) => generate(shell, &mut app, name, &mut File::create(path)?),
             None => generate(shell, &mut app, name, &mut stdout()),
         };
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    fn generate_manpage(&self) -> Result<CommandOutcome> {
+    fn generate_manpage(&self) -> Result<()> {
         let app = ShuttleArgs::command();
         let output = std::io::stdout();
         let mut output_handle = output.lock();
@@ -904,19 +1048,19 @@ impl Shuttle {
             }
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn status(&self) -> Result<CommandOutcome> {
+    async fn status(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         let summary = client.get_service(self.ctx.project_name()).await?;
 
         println!("{summary}");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn clean(&self) -> Result<CommandOutcome> {
+    async fn clean(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         let message = client
             .clean_project(self.ctx.project_name())
@@ -931,49 +1075,40 @@ impl Shuttle {
             })?;
         println!("{message}");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn logs_beta(&self, args: LogsArgs) -> Result<CommandOutcome> {
+    async fn logs_beta(&self, args: LogsArgs) -> Result<()> {
         if args.follow {
             eprintln!("Streamed logs are not yet supported on beta.");
-            return Ok(CommandOutcome::Ok);
+            return Ok(());
         }
         // TODO: implement logs range
         let client = self.client.as_ref().unwrap();
-        let proj_name = self.ctx.project_name();
+        let pid = self.ctx.project_id();
         let logs = if args.all_deployments {
-            client.get_project_logs_beta(proj_name).await?.logs
+            client.get_project_logs_beta(pid).await?.logs
         } else {
             let id = if args.latest {
                 // Find latest deployment (not always an active one)
-                let deployments =
-                    client
-                        .get_deployments_beta(proj_name, 1, 1)
-                        .await
-                        .map_err(|err| {
-                            suggestions::logs::get_logs_failure(
-                                err,
-                                "Fetching the latest deployment failed",
-                            )
-                        })?;
+                let deployments = client.get_deployments_beta(pid, 1, 1).await?.deployments;
                 let Some(most_recent) = deployments.first() else {
                     println!("No deployments found");
-                    return Ok(CommandOutcome::Ok);
+                    return Ok(());
                 };
                 eprintln!("Getting logs from: {}", most_recent.id);
                 most_recent.id.to_string()
             } else if let Some(id) = args.id {
                 id
             } else {
-                let Some(current) = client.get_current_deployment_beta(proj_name).await? else {
+                let Some(current) = client.get_current_deployment_beta(pid).await? else {
                     println!("No deployments found");
-                    return Ok(CommandOutcome::Ok);
+                    return Ok(());
                 };
                 eprintln!("Getting logs from: {}", current.id);
                 current.id
             };
-            client.get_deployment_logs_beta(proj_name, &id).await?.logs
+            client.get_deployment_logs_beta(pid, &id).await?.logs
         };
         for log in logs {
             if args.raw {
@@ -983,10 +1118,10 @@ impl Shuttle {
             }
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn logs(&self, args: LogsArgs) -> Result<CommandOutcome> {
+    async fn logs(&self, args: LogsArgs) -> Result<()> {
         let range = match (args.head, args.tail, args.all) {
             (Some(num), _, _) => LogsRange::Head(num),
             (_, Some(num), _) => LogsRange::Tail(num),
@@ -1075,19 +1210,14 @@ impl Shuttle {
             }
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn deployments_list(
-        &self,
-        page: u32,
-        limit: u32,
-        table_args: TableArgs,
-    ) -> Result<CommandOutcome> {
+    async fn deployments_list(&self, page: u32, limit: u32, table_args: TableArgs) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         if limit == 0 {
             println!();
-            return Ok(CommandOutcome::Ok);
+            return Ok(());
         }
         let limit = limit + 1;
 
@@ -1095,9 +1225,9 @@ impl Shuttle {
 
         let deployments_len = if self.beta {
             let mut deployments = client
-                .get_deployments_beta(proj_name, page as i32, limit as i32)
-                .await
-                .map_err(suggestions::deployment::get_deployments_list_failure)?;
+                .get_deployments_beta(self.ctx.project_id(), page as i32, limit as i32)
+                .await?
+                .deployments;
             let page_hint = if deployments.len() == limit as usize {
                 deployments.pop();
                 true
@@ -1140,31 +1270,25 @@ impl Shuttle {
             println!("Run `cargo shuttle logs <id>` to get logs for a given deployment.");
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn deployment_get(&self, deployment_id: Option<String>) -> Result<CommandOutcome> {
+    async fn deployment_get(&self, deployment_id: Option<String>) -> Result<()> {
         let client = self.client.as_ref().unwrap();
 
         if self.beta {
+            let pid = self.ctx.project_id();
             let deployment = match deployment_id {
-                Some(id) => {
-                    client
-                        .get_deployment_beta(self.ctx.project_name(), &id)
-                        .await
-                }
+                Some(id) => client.get_deployment_beta(pid, &id).await,
                 None => {
-                    let d = client
-                        .get_current_deployment_beta(self.ctx.project_name())
-                        .await?;
+                    let d = client.get_current_deployment_beta(pid).await?;
                     let Some(d) = d else {
                         println!("No deployment found");
-                        return Ok(CommandOutcome::Ok);
+                        return Ok(());
                     };
                     Ok(d)
                 }
-            }
-            .map_err(suggestions::deployment::get_deployment_status_failure)?;
+            }?;
             println!("{}", deployment.to_string_colored());
         } else {
             let deployment_id = deployment_id.expect("deployment id required on alpha platform");
@@ -1181,43 +1305,44 @@ impl Shuttle {
             println!("{deployment}");
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn resources_list(
-        &self,
-        table_args: TableArgs,
-        show_secrets: bool,
-    ) -> Result<CommandOutcome> {
+    async fn resources_list(&self, table_args: TableArgs, show_secrets: bool) -> Result<()> {
         let client = self.client.as_ref().unwrap();
-        let resources = if self.beta {
-            client
-                .get_service_resources_beta(self.ctx.project_name())
-                .await
-        } else {
-            client.get_service_resources(self.ctx.project_name()).await
-        }
-        .map_err(suggestions::resources::get_service_resources_failure)?;
-
-        // TODO: Beta table formats
+        let resources = client
+            .get_service_resources(self.ctx.project_name())
+            .await
+            .map_err(suggestions::resources::get_service_resources_failure)?;
         let table = get_resource_tables(
             &resources,
             self.ctx.project_name(),
             table_args.raw,
             show_secrets,
-            self.beta,
         );
 
         println!("{table}");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
+    }
+
+    async fn resources_list_beta(&self, table_args: TableArgs, show_secrets: bool) -> Result<()> {
+        let client = self.client.as_ref().unwrap();
+        let pid = self.ctx.project_id();
+        let resources = client.get_service_resources_beta(pid).await?.resources;
+        let table =
+            get_resource_tables_beta(resources.as_slice(), pid, table_args.raw, show_secrets);
+
+        println!("{table}");
+
+        Ok(())
     }
 
     async fn resource_delete(
         &self,
         resource_type: &resource::Type,
         no_confirm: bool,
-    ) -> Result<CommandOutcome> {
+    ) -> Result<()> {
         let client = self.client.as_ref().unwrap();
 
         if !no_confirm {
@@ -1239,21 +1364,22 @@ impl Shuttle {
                 .interact()
                 .unwrap()
             {
-                return Ok(CommandOutcome::Ok);
+                return Ok(());
             }
         }
 
         if self.beta {
-            client
-                .delete_service_resource_beta(self.ctx.project_name(), resource_type)
+            let msg = client
+                .delete_service_resource_beta(self.ctx.project_id(), resource_type)
                 .await?;
+            println!("{msg}");
         } else {
             client
                 .delete_service_resource(self.ctx.project_name(), resource_type)
                 .await?;
+            println!("Deleted resource {resource_type}");
         }
 
-        println!("Deleted resource {resource_type}");
         println!(
             "{}",
             formatdoc! {"
@@ -1264,15 +1390,65 @@ impl Shuttle {
             .yellow(),
         );
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn spin_local_runtime(
-        beta: bool,
-        run_args: &RunArgs,
-        service: &BuiltService,
-        idx: u16,
-    ) -> Result<Option<(Child, runtime::Client)>> {
+    async fn list_certificates(&self, table_args: TableArgs) -> Result<()> {
+        let client = self.client.as_ref().unwrap();
+        let certs = client
+            .list_certificates_beta(self.ctx.project_id())
+            .await?
+            .certificates;
+
+        let table = get_certificates_table_beta(certs.as_ref(), table_args.raw);
+        println!("{}", table);
+
+        Ok(())
+    }
+    async fn add_certificate(&self, domain: String) -> Result<()> {
+        let client = self.client.as_ref().unwrap();
+        let cert = client
+            .add_certificate_beta(self.ctx.project_id(), domain.clone())
+            .await?;
+
+        println!("Added certificate for {}", cert.subject);
+
+        Ok(())
+    }
+    async fn delete_certificate(&self, domain: String, no_confirm: bool) -> Result<()> {
+        let client = self.client.as_ref().unwrap();
+
+        if !no_confirm {
+            println!(
+                "{}",
+                formatdoc!(
+                    "
+                WARNING:
+                    Delete the certificate for {}?",
+                    domain
+                )
+                .bold()
+                .red()
+            );
+            if !Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt("Are you sure?")
+                .default(false)
+                .interact()
+                .unwrap()
+            {
+                return Ok(());
+            }
+        }
+
+        let msg = client
+            .delete_certificate_beta(self.ctx.project_id(), domain.clone())
+            .await?;
+        println!("{msg}");
+
+        Ok(())
+    }
+
+    fn get_secrets(run_args: &RunArgs, service: &BuiltService) -> Result<HashMap<String, String>> {
         let secrets_file = run_args.secret_args.secrets.clone().or_else(|| {
             let crate_dir = service.crate_directory();
             // Prioritise crate-local prod secrets over workspace dev secrets (in the rare case that both exist)
@@ -1300,8 +1476,11 @@ impl Shuttle {
             Default::default()
         };
 
-        trace!(path = ?service.executable_path, "using alpha runtime");
-        if let Err(err) = check_version(&service.executable_path).await {
+        Ok(secrets)
+    }
+
+    async fn check_and_warn_runtime_version(path: &Path) -> Result<()> {
+        if let Err(err) = check_version(path).await {
             warn!("{}", err);
             if let Some(mismatch) = err.downcast_ref::<VersionMismatchError>() {
                 println!("Warning: {}.", mismatch);
@@ -1310,13 +1489,13 @@ impl Shuttle {
                     // should help the user to update cargo-shuttle.
                     printdoc! {"
                         Hint: A newer version of cargo-shuttle is available.
-                                Check out the installation docs for how to update: {SHUTTLE_INSTALL_DOCS_URL}",
+                              Check out the installation docs for how to update: {SHUTTLE_INSTALL_DOCS_URL}",
                     };
                 } else {
                     printdoc! {"
                         Hint: A newer version of shuttle-runtime is available.
-                        Change its version to {} in Cargo.toml to update it, or
-                        run this command: cargo add shuttle-runtime@{}",
+                              Change its version to {} in Cargo.toml to update it,
+                              or run this command: cargo add shuttle-runtime@{}",
                         mismatch.cargo_shuttle,
                         mismatch.cargo_shuttle,
                     };
@@ -1325,24 +1504,32 @@ impl Shuttle {
                 return Err(err.context(
                     format!(
                         "Failed to verify the version of shuttle-runtime in {}. Is cargo targeting the correct executable?",
-                        service.executable_path.display()
+                        path.display()
                     )
                 ));
             }
         }
-        let runtime_executable = service.executable_path.clone();
 
+        Ok(())
+    }
+
+    async fn spin_local_runtime(
+        run_args: &RunArgs,
+        service: &BuiltService,
+        idx: u16,
+    ) -> Result<Option<(Child, runtime::Client)>> {
+        let secrets = Shuttle::get_secrets(run_args, service)?;
+
+        trace!(path = ?service.executable_path, "runtime executable");
+
+        Shuttle::check_and_warn_runtime_version(&service.executable_path).await?;
+
+        let runtime_executable = service.executable_path.clone();
         let port =
             portpicker::pick_unused_port().expect("unable to find available port for gRPC server");
         // Child process and gRPC client for sending requests to it
-        let (mut runtime, mut runtime_client) = runner::start(
-            beta,
-            port,
-            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port),
-            runtime_executable,
-            service.workspace_path.as_path(),
-        )
-        .await?;
+        let (mut runtime, mut runtime_client) =
+            runner::start(port, runtime_executable, service.workspace_path.as_path()).await?;
 
         let service_name = service.service_name()?;
         let deployment_id: Uuid = Default::default();
@@ -1412,15 +1599,7 @@ impl Shuttle {
 
         println!(
             "{}",
-            get_resource_tables(
-                &mocked_responses,
-                service_name.as_str(),
-                false,
-                false,
-                // Set beta to false to avoid breaking local run with beta changes.
-                // TODO: make local run compatible with --beta.
-                false
-            )
+            get_resource_tables(&mocked_responses, service_name.as_str(), false, false,)
         );
 
         //
@@ -1531,7 +1710,6 @@ impl Shuttle {
                     *bytes = serde_json::to_vec(&ShuttleResourceOutput {
                         output: res,
                         custom: shuttle_resource.custom,
-                        state: None
                     })
                     .unwrap();
                 }
@@ -1545,7 +1723,6 @@ impl Shuttle {
                     *bytes = serde_json::to_vec(&ShuttleResourceOutput {
                         output: secrets.clone(),
                         custom: shuttle_resource.custom,
-                        state: None
                     })
                     .unwrap();
                 }
@@ -1564,7 +1741,6 @@ impl Shuttle {
                     *bytes = serde_json::to_vec(&ShuttleResourceOutput {
                         output: res,
                         custom: shuttle_resource.custom,
-                        state: None
                     })
                     .unwrap();
                 }
@@ -1626,7 +1802,7 @@ impl Shuttle {
     }
 
     async fn pre_local_run(&self, run_args: &RunArgs) -> Result<Vec<BuiltService>> {
-        trace!("starting a local run for a service: {run_args:?}");
+        trace!("starting a local run with args: {run_args:?}");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
         tokio::task::spawn(async move {
@@ -1649,7 +1825,7 @@ impl Shuttle {
 
     fn find_available_port(run_args: &mut RunArgs, services_len: usize) {
         let default_port = run_args.port;
-        'outer: for port in (run_args.port..=std::u16::MAX).step_by(services_len.max(10)) {
+        'outer: for port in (run_args.port..=u16::MAX).step_by(services_len.max(10)) {
             for inner_port in port..(port + services_len as u16) {
                 if !portpicker::is_free_tcp(inner_port) {
                     continue 'outer;
@@ -1672,10 +1848,26 @@ impl Shuttle {
             exit(0);
         }
     }
+    fn find_available_port_beta(run_args: &mut RunArgs) {
+        let original_port = run_args.port;
+        for port in (run_args.port..=u16::MAX).step_by(10) {
+            if !portpicker::is_free_tcp(port) {
+                continue;
+            }
+            run_args.port = port;
+            break;
+        }
+
+        if run_args.port != original_port {
+            eprintln!(
+                "Port {} is already in use. Using port {}.",
+                original_port, run_args.port,
+            )
+        };
+    }
 
     #[cfg(target_family = "unix")]
-    async fn local_run(&self, mut run_args: RunArgs) -> Result<CommandOutcome> {
-        debug!("starting local run");
+    async fn local_run(&self, mut run_args: RunArgs) -> Result<()> {
         let services = self.pre_local_run(&run_args).await?;
 
         let mut sigterm_notif =
@@ -1695,7 +1887,7 @@ impl Shuttle {
             // We must cover the case of starting multiple workspace services and receiving a signal in parallel.
             // This must stop all the existing runtimes and creating new ones.
             signal_received = tokio::select! {
-                res = Shuttle::spin_local_runtime(self.beta, &run_args, service, i as u16) => {
+                res = Shuttle::spin_local_runtime(&run_args, service, i as u16) => {
                     match res {
                         Ok(runtime) => {
                             Shuttle::add_runtime_info(runtime, &mut runtimes).await?;
@@ -1733,7 +1925,7 @@ impl Shuttle {
                         trace!(status = ?err, "stopping the runtime errored out");
                     });
             }
-            return Ok(CommandOutcome::Ok);
+            return Ok(());
         }
 
         // If no signal was received during runtimes initialization, then we must handle each runtime until
@@ -1785,7 +1977,193 @@ impl Shuttle {
              Run `cargo shuttle deploy` to deploy your Shuttle service."
         );
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
+    }
+
+    async fn local_run_beta(&self, mut run_args: RunArgs, debug: bool) -> Result<()> {
+        let project_name = self.ctx.project_name().to_owned();
+        let services = self.pre_local_run(&run_args).await?;
+        let service = services
+            .first()
+            .expect("at least one shuttle service")
+            .to_owned();
+
+        trace!(path = ?service.executable_path, "runtime executable");
+
+        let secrets = Shuttle::get_secrets(&run_args, &service)?;
+        Shuttle::find_available_port_beta(&mut run_args);
+        Shuttle::check_and_warn_runtime_version(&service.executable_path).await?;
+
+        let runtime_executable = service.executable_path.clone();
+        let api_port = portpicker::pick_unused_port()
+            .expect("failed to find available port for local provisioner server");
+        let api_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), api_port);
+        let ip = if run_args.external {
+            Ipv4Addr::UNSPECIFIED
+        } else {
+            Ipv4Addr::LOCALHOST
+        };
+
+        let state = Arc::new(ProvApiState {
+            project_name: project_name.clone(),
+            secrets,
+        });
+        ProvisionerServerBeta::start(state, &api_addr);
+
+        println!(
+            "\n    {} {} on http://{}:{}\n",
+            "Starting".bold().green(),
+            service.package_name,
+            ip,
+            run_args.port,
+        );
+
+        info!(
+            path = %runtime_executable.display(),
+            "Spawning runtime process",
+        );
+        let mut runtime = tokio::process::Command::new(
+            dunce::canonicalize(runtime_executable).context("canonicalize path of executable")?,
+        )
+        .current_dir(&service.workspace_path)
+        .envs([
+            ("SHUTTLE_BETA", "true"),
+            ("SHUTTLE_PROJECT_ID", "proj_LOCAL"),
+            ("SHUTTLE_PROJECT_NAME", project_name.as_str()),
+            ("SHUTTLE_ENV", Environment::Local.to_string().as_str()),
+            ("SHUTTLE_RUNTIME_IP", ip.to_string().as_str()),
+            ("SHUTTLE_RUNTIME_PORT", run_args.port.to_string().as_str()),
+            (
+                "SHUTTLE_API",
+                format!("http://127.0.0.1:{}", api_port).as_str(),
+            ),
+            (
+                "RUST_LOG",
+                if debug {
+                    "info,shuttle=trace,reqwest=debug"
+                } else {
+                    "info"
+                },
+            ),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("spawning runtime process")?;
+
+        let raw = run_args.raw;
+        let mut stdout_reader = BufReader::new(
+            runtime
+                .stdout
+                .take()
+                .context("child process did not have a handle to stdout")?,
+        )
+        .lines();
+        tokio::spawn(async move {
+            while let Some(line) = stdout_reader.next_line().await.unwrap() {
+                if raw {
+                    println!("{}", line);
+                } else {
+                    let log_item = LogItemBeta::new(Utc::now(), "app".to_owned(), line);
+                    println!("{log_item}");
+                }
+            }
+        });
+        let mut stderr_reader = BufReader::new(
+            runtime
+                .stderr
+                .take()
+                .context("child process did not have a handle to stderr")?,
+        )
+        .lines();
+        tokio::spawn(async move {
+            while let Some(line) = stderr_reader.next_line().await.unwrap() {
+                if raw {
+                    println!("{}", line);
+                } else {
+                    let log_item = LogItemBeta::new(Utc::now(), "app".to_owned(), line);
+                    println!("{log_item}");
+                }
+            }
+        });
+
+        #[cfg(target_family = "unix")]
+        let exit_result = {
+            let mut sigterm_notif =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Can not get the SIGTERM signal receptor");
+            let mut sigint_notif =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .expect("Can not get the SIGINT signal receptor");
+            tokio::select! {
+                exit_result = runtime.wait() => {
+                    Some(exit_result)
+                }
+                _ = sigterm_notif.recv() => {
+                    eprintln!("cargo-shuttle received SIGTERM. Killing the runtime...");
+                    None
+                },
+                _ = sigint_notif.recv() => {
+                    eprintln!("cargo-shuttle received SIGINT. Killing the runtime...");
+                    None
+                }
+            }
+        };
+        #[cfg(target_family = "windows")]
+        let exit_result = {
+            let mut ctrl_break_notif = tokio::signal::windows::ctrl_break()
+                .expect("Can not get the CtrlBreak signal receptor");
+            let mut ctrl_c_notif =
+                tokio::signal::windows::ctrl_c().expect("Can not get the CtrlC signal receptor");
+            let mut ctrl_close_notif = tokio::signal::windows::ctrl_close()
+                .expect("Can not get the CtrlClose signal receptor");
+            let mut ctrl_logoff_notif = tokio::signal::windows::ctrl_logoff()
+                .expect("Can not get the CtrlLogoff signal receptor");
+            let mut ctrl_shutdown_notif = tokio::signal::windows::ctrl_shutdown()
+                .expect("Can not get the CtrlShutdown signal receptor");
+            tokio::select! {
+                exit_result = runtime.wait() => {
+                    Some(exit_result)
+                }
+                _ = ctrl_break_notif.recv() => {
+                    eprintln!("cargo-shuttle received ctrl-break.");
+                    None
+                },
+                _ = ctrl_c_notif.recv() => {
+                    eprintln!("cargo-shuttle received ctrl-c.");
+                    None
+                },
+                _ = ctrl_close_notif.recv() => {
+                    eprintln!("cargo-shuttle received ctrl-close.");
+                    None
+                },
+                _ = ctrl_logoff_notif.recv() => {
+                    eprintln!("cargo-shuttle received ctrl-logoff.");
+                    None
+                },
+                _ = ctrl_shutdown_notif.recv() => {
+                    eprintln!("cargo-shuttle received ctrl-shutdown.");
+                    None
+                }
+            }
+        };
+        match exit_result {
+            Some(Ok(exit_status)) => {
+                bail!(
+                    "Runtime process exited with code {}",
+                    exit_status.code().unwrap_or_default()
+                );
+            }
+            Some(Err(e)) => {
+                bail!("Failed to wait for runtime process to exit: {e}");
+            }
+            None => {
+                runtime.kill().await?;
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(target_family = "windows")]
@@ -1829,7 +2207,7 @@ impl Shuttle {
     }
 
     #[cfg(target_family = "windows")]
-    async fn local_run(&self, mut run_args: RunArgs) -> Result<CommandOutcome> {
+    async fn local_run(&self, mut run_args: RunArgs) -> Result<()> {
         let services = self.pre_local_run(&run_args).await?;
 
         // Start all the services.
@@ -1840,7 +2218,7 @@ impl Shuttle {
         let mut signal_received = false;
         for (i, service) in services.iter().enumerate() {
             signal_received = tokio::select! {
-                res = Shuttle::spin_local_runtime(self.beta, &run_args, service, i as u16) => {
+                res = Shuttle::spin_local_runtime(&run_args, service, i as u16) => {
                     Shuttle::add_runtime_info(res.unwrap(), &mut runtimes).await?;
                     false
                 },
@@ -1867,7 +2245,7 @@ impl Shuttle {
                         trace!(status = ?err, "stopping the runtime errored out");
                     });
             }
-            return Ok(CommandOutcome::Ok);
+            return Ok(());
         }
 
         // If no signal was received during runtimes initialization, then we must handle each runtime until
@@ -1910,10 +2288,10 @@ impl Shuttle {
              Run `cargo shuttle deploy` to deploy your Shuttle service."
         );
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn deploy(&mut self, args: DeployArgs) -> Result<CommandOutcome> {
+    async fn deploy(&mut self, args: DeployArgs) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         let working_directory = self.ctx.working_directory();
         let manifest_path = working_directory.join("Cargo.toml");
@@ -1959,14 +2337,13 @@ impl Shuttle {
 
                 let deployment = client
                     .deploy_beta(
-                        project_name,
+                        self.ctx.project_id(),
                         DeploymentRequestBeta::Image(deployment_req_image_beta),
                     )
-                    .await
-                    .map_err(suggestions::deploy::deploy_request_failure)?;
+                    .await?;
 
                 println!("{}", deployment.to_string_colored());
-                return Ok(CommandOutcome::Ok);
+                return Ok(());
             }
         }
 
@@ -2048,14 +2425,16 @@ impl Shuttle {
             }
         }
 
+        if self.beta {
+            eprintln!("Packing files...");
+        }
         let archive = self.make_archive(args.secret_args.secrets.clone(), self.beta)?;
 
         if let Some(path) = args.output_archive {
-            eprintln!("Writing archive to {}...", path.display());
+            eprintln!("Writing archive to {}", path.display());
             std::fs::write(path, archive).context("writing archive")?;
-            eprintln!("Done");
 
-            return Ok(CommandOutcome::Ok);
+            return Ok(());
         }
 
         if !self.beta && archive.len() > CREATE_SERVICE_BODY_LIMIT {
@@ -2070,7 +2449,12 @@ impl Shuttle {
 
         // End early for beta
         if self.beta {
-            let arch = client.upload_archive_beta(project_name, archive).await?;
+            // TODO: upload secrets separately
+
+            let pid = self.ctx.project_id();
+
+            eprintln!("Uploading code...");
+            let arch = client.upload_archive_beta(pid, archive).await?;
             deployment_req_buildarch_beta.archive_version_id = arch.archive_version_id;
             deployment_req_buildarch_beta.build_meta = Some(BuildMetaBeta {
                 git_commit_id: deployment_req.git_commit_id,
@@ -2078,22 +2462,23 @@ impl Shuttle {
                 git_branch: deployment_req.git_branch,
                 git_dirty: deployment_req.git_dirty,
             });
+
+            eprintln!("Creating deployment...");
             let deployment = client
                 .deploy_beta(
-                    project_name,
+                    pid,
                     DeploymentRequestBeta::BuildArchive(deployment_req_buildarch_beta),
                 )
-                .await
-                .map_err(suggestions::deploy::deploy_request_failure)?;
+                .await?;
 
             if args.no_follow {
                 println!("{}", deployment.to_string_colored());
-                return Ok(CommandOutcome::Ok);
+                return Ok(());
             }
 
             let id = &deployment.id;
             wait_with_spinner(2000, |_, pb| async move {
-                let deployment = client.get_deployment_beta(project_name, id).await?;
+                let deployment = client.get_deployment_beta(pid, id).await?;
 
                 let state = deployment.state.clone();
                 pb.set_message(deployment.to_string_summary_colored());
@@ -2101,15 +2486,15 @@ impl Shuttle {
                     println!("{}", deployment.to_string_colored());
                 };
                 match state {
-                    EcsState::Pending | EcsState::Building | EcsState::InProgress => Ok(None),
-                    EcsState::Running => Ok(Some(cleanup)),
-                    EcsState::Stopped | EcsState::Stopping | EcsState::Unknown => Ok(Some(cleanup)),
-                    EcsState::Failed => {
-                        for log in client
-                            .get_deployment_logs_beta(project_name, id)
-                            .await?
-                            .logs
-                        {
+                    DeploymentStateBeta::Pending
+                    | DeploymentStateBeta::Building
+                    | DeploymentStateBeta::InProgress => Ok(None),
+                    DeploymentStateBeta::Running => Ok(Some(cleanup)),
+                    DeploymentStateBeta::Stopped
+                    | DeploymentStateBeta::Stopping
+                    | DeploymentStateBeta::Unknown => Ok(Some(cleanup)),
+                    DeploymentStateBeta::Failed => {
+                        for log in client.get_deployment_logs_beta(pid, id).await?.logs {
                             if args.raw {
                                 println!("{}", log.line);
                             } else {
@@ -2122,21 +2507,17 @@ impl Shuttle {
             })
             .await?;
 
-            return Ok(CommandOutcome::Ok);
+            return Ok(());
         }
 
         deployment_req.data = archive;
         let deployment = client
-            .deploy(self.ctx.project_name(), deployment_req)
+            .deploy(project_name, deployment_req)
             .await
             .map_err(suggestions::deploy::deploy_request_failure)?;
 
         let mut stream = client
-            .get_logs_ws(
-                self.ctx.project_name(),
-                &deployment.id.to_string(),
-                LogsRange::All,
-            )
+            .get_logs_ws(project_name, &deployment.id.to_string(), LogsRange::All)
             .await
             .map_err(|err| {
                 suggestions::deploy::deployment_setup_failure(
@@ -2240,7 +2621,7 @@ impl Shuttle {
                         println!();
                         println!("cargo shuttle logs {}", &deployment.id);
 
-                        return Ok(CommandOutcome::DeploymentFailure);
+                        bail!("");
                     }
                     if DEPLOYER_END_MESSAGES_GOOD
                         .iter()
@@ -2256,11 +2637,7 @@ impl Shuttle {
                 // the terminal isn't completely spammed
                 sleep(Duration::from_millis(100)).await;
                 stream = client
-                    .get_logs_ws(
-                        self.ctx.project_name(),
-                        &deployment.id.to_string(),
-                        LogsRange::All,
-                    )
+                    .get_logs_ws(project_name, &deployment.id.to_string(), LogsRange::All)
                     .await
                     .map_err(|err| {
                         suggestions::deploy::deployment_setup_failure(
@@ -2277,7 +2654,7 @@ impl Shuttle {
         sleep(Duration::from_millis(500)).await;
 
         let deployment = client
-            .get_deployment_details(self.ctx.project_name(), &deployment.id)
+            .get_deployment_details(project_name, &deployment.id)
             .await
             .map_err(|err| {
                 suggestions::deploy::deployment_setup_failure(
@@ -2320,22 +2697,19 @@ impl Shuttle {
             println!();
             println!("cargo shuttle logs {}", &deployment.id);
 
-            return Ok(CommandOutcome::DeploymentFailure);
+            bail!("");
         }
 
-        let service = client.get_service(self.ctx.project_name()).await?;
-        let resources = client
-            .get_service_resources(self.ctx.project_name())
-            .await?;
-        let resources =
-            get_resource_tables(&resources, self.ctx.project_name(), false, false, self.beta);
+        let service = client.get_service(project_name).await?;
+        let resources = client.get_service_resources(project_name).await?;
+        let resources = get_resource_tables(&resources, project_name, false, false);
 
         println!("{resources}{service}");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn project_start(&self, idle_minutes: u64) -> Result<CommandOutcome> {
+    async fn project_start(&self, idle_minutes: u64) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         let config = &project::Config { idle_minutes };
 
@@ -2386,27 +2760,20 @@ impl Shuttle {
 
         println!("Run `cargo shuttle deploy --allow-dirty` to deploy your Shuttle service.");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn project_start_beta(&self) -> Result<CommandOutcome> {
+    async fn project_create_beta(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         let name = self.ctx.project_name();
-        let project = client.create_project_beta(name).await.map_err(|err| {
-            suggestions::project::project_request_failure(
-                err,
-                "Project creation failed",
-                true,
-                "the project creation fails repeatedly",
-            )
-        })?;
+        let project = client.create_project_beta(name).await?;
 
         println!("Created project '{}' with id {}", project.name, project.id);
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn project_restart(&self, idle_minutes: u64) -> Result<CommandOutcome> {
+    async fn project_restart(&self, idle_minutes: u64) -> Result<()> {
         self.project_stop()
             .await
             .map_err(suggestions::project::project_restart_failure)?;
@@ -2414,26 +2781,15 @@ impl Shuttle {
             .await
             .map_err(suggestions::project::project_restart_failure)?;
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn projects_list(&self, table_args: TableArgs) -> Result<CommandOutcome> {
+    async fn projects_list(&self, table_args: TableArgs) -> Result<()> {
         let client = self.client.as_ref().unwrap();
 
         let projects_table = if self.beta {
             project::get_projects_table_beta(
-                &client
-                    .get_projects_list_beta()
-                    .await
-                    .map_err(|err| {
-                        suggestions::project::project_request_failure(
-                            err,
-                            "Getting projects list failed",
-                            false,
-                            "getting the projects list fails repeatedly",
-                        )
-                    })?
-                    .projects,
+                &client.get_projects_list_beta().await?.projects,
                 table_args.raw,
             )
         } else {
@@ -2453,47 +2809,23 @@ impl Shuttle {
         println!("{}", "Personal Projects".bold());
         println!("{projects_table}\n");
 
-        let teams = client.get_teams_list().await?;
+        if !self.beta {
+            let teams = client.get_teams_list().await?;
 
-        for team in teams {
-            let team_projects_table = if self.beta {
-                let team_projects = client
-                    .get_team_projects_list_beta(&team.id)
-                    .await
-                    .map_err(|err| {
-                        suggestions::project::project_request_failure(
-                            err,
-                            "Getting teams projects list failed",
-                            false,
-                            "getting the team projects list fails repeatedly",
-                        )
-                    })?
-                    .projects;
-                project::get_projects_table_beta(&team_projects, table_args.raw)
-            } else {
-                let team_projects =
-                    client
-                        .get_team_projects_list(&team.id)
-                        .await
-                        .map_err(|err| {
-                            suggestions::project::project_request_failure(
-                                err,
-                                "Getting teams projects list failed",
-                                false,
-                                "getting the team projects list fails repeatedly",
-                            )
-                        })?;
-                project::get_projects_table(&team_projects, table_args.raw)
-            };
+            for team in teams {
+                let team_projects = client.get_team_projects_list(&team.id).await?;
+                let team_projects_table =
+                    project::get_projects_table(&team_projects, table_args.raw);
 
-            println!("{}", format!("{}'s Projects", team.display_name).bold());
-            println!("{team_projects_table}\n");
+                println!("{}", format!("{}'s Projects", team.display_name).bold());
+                println!("{team_projects_table}\n");
+            }
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn project_status(&self, follow: bool) -> Result<CommandOutcome> {
+    async fn project_status(&self, follow: bool) -> Result<()> {
         let client = self.client.as_ref().unwrap();
         if follow {
             let p = self.ctx.project_name();
@@ -2540,17 +2872,17 @@ impl Shuttle {
             );
         }
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
-    async fn project_status_beta(&self) -> Result<CommandOutcome> {
+    async fn project_status_beta(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
-        let project = client.get_project_beta(self.ctx.project_name()).await?;
-        println!("{}", project.to_string_colored());
+        let project = client.get_project_beta(self.ctx.project_id()).await?;
+        print!("{}", project.to_string_colored());
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn project_stop(&self) -> Result<CommandOutcome> {
+    async fn project_stop(&self) -> Result<()> {
         let client = self.client.as_ref().unwrap();
 
         let p = self.ctx.project_name();
@@ -2589,10 +2921,10 @@ impl Shuttle {
         })?;
         println!("Run `cargo shuttle project start` to recreate project environment on Shuttle.");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
-    async fn project_delete(&self, no_confirm: bool) -> Result<CommandOutcome> {
+    async fn project_delete(&self, no_confirm: bool) -> Result<()> {
         let client = self.client.as_ref().unwrap();
 
         if !no_confirm {
@@ -2637,27 +2969,29 @@ impl Shuttle {
                 .interact()
                 .unwrap()
             {
-                return Ok(CommandOutcome::Ok);
+                return Ok(());
             }
         }
 
         if self.beta {
-            client.delete_project_beta(self.ctx.project_name()).await
+            client.delete_project_beta(self.ctx.project_id()).await?
         } else {
-            client.delete_project(self.ctx.project_name()).await
-        }
-        .map_err(|err| {
-            suggestions::project::project_request_failure(
-                err,
-                "Project delete failed",
-                true,
-                "deleting the project or getting project status fails repeatedly",
-            )
-        })?;
+            client
+                .delete_project(self.ctx.project_name())
+                .await
+                .map_err(|err| {
+                    suggestions::project::project_request_failure(
+                        err,
+                        "Project delete failed",
+                        true,
+                        "deleting the project or getting project status fails repeatedly",
+                    )
+                })?
+        };
 
         println!("Deleted project");
 
-        Ok(CommandOutcome::Ok)
+        Ok(())
     }
 
     fn make_archive(&self, secrets_file: Option<PathBuf>, zip: bool) -> Result<Vec<u8>> {
@@ -2759,10 +3093,11 @@ impl Shuttle {
             let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
             for (path, name) in archive_files {
                 debug!("Packing {path:?}");
-                zip.start_file(
-                    name.to_str().expect("valid filename"),
-                    FileOptions::default(),
-                )?;
+
+                // windows things
+                let name = name.to_str().expect("valid filename").replace('\\', "/");
+                zip.start_file(name, FileOptions::<()>::default())?;
+
                 let mut b = Vec::new();
                 File::open(path)?.read_to_end(&mut b)?;
                 zip.write_all(&b)?;
@@ -2959,10 +3294,48 @@ fn create_spinner() -> ProgressBar {
     pb
 }
 
-#[derive(PartialEq)]
-pub enum CommandOutcome {
-    Ok,
-    DeploymentFailure,
+fn feedback() -> Result<()> {
+    let _ = webbrowser::open(SHUTTLE_GH_ISSUE_URL);
+    eprintln!("If your browser did not open automatically, go to {SHUTTLE_GH_ISSUE_URL}");
+
+    Ok(())
+}
+
+async fn update_cargo_shuttle(preview: bool) -> Result<()> {
+    if preview {
+        let _ = tokio::process::Command::new("cargo")
+            .args(["install", "cargo-shuttle", "--git", SHUTTLE_GH_REPO_URL])
+            .kill_on_drop(true)
+            .spawn()
+            .context("Failed to spawn cargo install process")?
+            .wait()
+            .await
+            .context("Failed to wait on cargo install process")?;
+
+        return Ok(());
+    }
+
+    #[cfg(target_family = "unix")]
+    let _ = tokio::process::Command::new("bash")
+        .args(["-c", "curl -sSfL https://www.shuttle.rs/install | bash"])
+        .kill_on_drop(true)
+        .spawn()
+        .context("Failed to spawn bash update process")?
+        .wait()
+        .await
+        .context("Failed to wait on bash update process")?;
+
+    #[cfg(target_family = "windows")]
+    let _ = tokio::process::Command::new("powershell")
+        .args(["-Command", "iwr https://www.shuttle.rs/install-win | iex"])
+        .kill_on_drop(true)
+        .spawn()
+        .context("Failed to spawn powershell update process")?
+        .wait()
+        .await
+        .context("Failed to wait on powershell update process")?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2985,13 +3358,13 @@ mod tests {
         dunce::canonicalize(path).unwrap()
     }
 
-    fn get_archive_entries(
+    async fn get_archive_entries(
         project_args: ProjectArgs,
         deploy_args: DeployArgs,
         zip: bool,
     ) -> Vec<String> {
-        let mut shuttle = Shuttle::new().unwrap();
-        shuttle.load_project(&project_args).unwrap();
+        let mut shuttle = Shuttle::new(crate::Binary::CargoShuttle).unwrap();
+        shuttle.load_project(&project_args, false).await.unwrap();
 
         let archive = shuttle
             .make_archive(deploy_args.secret_args.secrets, zip)
@@ -3024,8 +3397,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn make_archive_respect_rules() {
+    #[tokio::test]
+    async fn make_archive_respect_rules() {
         let working_directory = canonicalize(path_from_workspace_root(
             "cargo-shuttle/tests/resources/archiving",
         ))
@@ -3043,9 +3416,10 @@ mod tests {
 
         let project_args = ProjectArgs {
             working_directory: working_directory.clone(),
-            name: Some("archiving-test".to_owned()),
+            name_or_id: Some("archiving-test".to_owned()),
         };
-        let mut entries = get_archive_entries(project_args.clone(), Default::default(), false);
+        let mut entries =
+            get_archive_entries(project_args.clone(), Default::default(), false).await;
         entries.sort();
 
         let expected = vec![
@@ -3068,7 +3442,7 @@ mod tests {
         assert_eq!(entries, expected);
 
         // check that zip behaves the same way
-        let mut entries = get_archive_entries(project_args.clone(), Default::default(), true);
+        let mut entries = get_archive_entries(project_args.clone(), Default::default(), true).await;
         entries.sort();
         assert_eq!(entries, expected);
 
@@ -3082,7 +3456,8 @@ mod tests {
                 ..Default::default()
             },
             false,
-        );
+        )
+        .await;
         entries.sort();
 
         assert_eq!(
@@ -3107,15 +3482,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finds_workspace_root() {
+    #[tokio::test]
+    async fn finds_workspace_root() {
         let project_args = ProjectArgs {
             working_directory: path_from_workspace_root("examples/axum/hello-world/src"),
-            name: None,
+            name_or_id: None,
         };
 
-        let mut shuttle = Shuttle::new().unwrap();
-        shuttle.load_project(&project_args).unwrap();
+        let mut shuttle = Shuttle::new(crate::Binary::CargoShuttle).unwrap();
+        shuttle.load_project(&project_args, false).await.unwrap();
 
         assert_eq!(
             project_args.working_directory,

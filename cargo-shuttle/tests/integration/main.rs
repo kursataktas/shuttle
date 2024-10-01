@@ -1,24 +1,21 @@
 mod init;
 mod run;
 
-use cargo_shuttle::{Command, CommandOutcome, ProjectArgs, Shuttle, ShuttleArgs};
+use cargo_shuttle::{Command, ProjectArgs, Shuttle, ShuttleArgs};
 use std::path::Path;
 
 /// creates a `cargo-shuttle` run instance with some reasonable defaults set.
-async fn cargo_shuttle_command(
-    cmd: Command,
-    working_directory: &str,
-) -> anyhow::Result<CommandOutcome> {
+async fn cargo_shuttle_command(cmd: Command, working_directory: &str) -> anyhow::Result<()> {
     let working_directory = Path::new(working_directory).to_path_buf();
 
-    Shuttle::new()
+    Shuttle::new(cargo_shuttle::Binary::CargoShuttle)
         .unwrap()
         .run(
             ShuttleArgs {
                 api_url: Some("http://shuttle.invalid:80".to_string()),
                 project_args: ProjectArgs {
                     working_directory,
-                    name: None,
+                    name_or_id: None,
                 },
                 offline: false,
                 debug: false,
