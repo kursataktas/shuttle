@@ -115,20 +115,21 @@ pub async fn start(loader: impl Loader + Send + 'static, runner: impl Runner + S
     info!("Loading resources");
 
     trace!("Getting secrets");
-    let secrets: BTreeMap<String, String> = match client
-        .get_secrets_beta(&project_id)
-        .await
-        .and_then(|r| serde_json::from_value(r.output).context("failed to deserialize secrets"))
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ERROR: Runtime Secret Loading phase failed: {e}");
-            exit(101);
-        }
-    };
+    info!("modified runtime");
+    // let secrets: BTreeMap<String, String> = match client
+    //     .get_secrets_beta(&project_id)
+    //     .await
+    //     .and_then(|r| serde_json::from_value(r.output).context("failed to deserialize secrets"))
+    // {
+    //     Ok(s) => s,
+    //     Err(e) => {
+    //         eprintln!("ERROR: Runtime Secret Loading phase failed: {e}");
+    //         exit(101);
+    //     }
+    // };
 
     // Sort secrets by key
-    let secrets = BTreeMap::from_iter(secrets.into_iter().map(|(k, v)| (k, Secret::new(v))));
+    let secrets = BTreeMap::new();
 
     // TODO: rework resourcefactory
     let factory = ResourceFactory::new(project_name, secrets.clone(), env);
